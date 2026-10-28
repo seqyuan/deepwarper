@@ -1,0 +1,50 @@
+# Distribution 草案：一组插件 + 补丁 + 默认策略
+apiVersion: deepwarper/v1
+kind: Distribution
+metadata:
+  name: default
+  version: 1.0.0
+  description: DeepWarper 最小发行版
+
+spec:
+  dsh:
+    version: 0.2.1-rc.2
+    # profile 名 = distribution name（default）
+
+  bundles:
+    # dsh-base MUST be first: it provides session/tools/sandbox/webserver.
+    - "@deepseek-ai/dsh-base"
+    - "@deepseek-ai/dsh-web-app"
+
+  packages: []
+    # - "file:./plugins/company-dsh-bio"
+    # - "@deepseek-ai/dsh-skill-office@0.2.1-rc.2"
+
+  patches:
+    - patches/00-default.patch.yml
+    # - patches/10-internal-mcp.patch.yml
+
+  skills: []
+    # - skills/scRNA
+    # - skills/report
+
+  homeSeed: home/
+
+  defaults:
+    resources:
+      cpu: 2
+      memory: 4Gi
+      walltime: 8h
+    idleTTL: 30m
+    mounts:
+      - name: workspace
+        target: /workspace
+        mode: rw
+        source: user
+      - name: ref
+        target: /data/ref
+        mode: ro
+        source: storage:ref
+    env:
+      - name: DEEPSEEK_BASE_URL
+        value: "https://api.deepseek.com"

@@ -1,0 +1,31 @@
+# 管理员声明的数据根（草案）。用户只能在这些根下选子路径。
+roots:
+  - id: projects
+    type: path
+    host: /data/projects
+    allowRw: true
+    description: 项目工作区
+
+  - id: ref
+    type: path
+    host: /data/ref
+    allowRw: false
+    description: 共享参考数据
+
+  - id: bio-raw
+    type: bucket
+    provider: fuse                 # fuse（首发）| premount | csi
+    uri: tos://bio-raw             # 也支持 s3://...
+    endpoint: tos-s3-cn-beijing.volces.com
+    region: cn-beijing
+    allowPrefixes:
+      - "P123/"
+      - "public/"
+    allowRw: false
+    fuse:
+      readOnly: true
+      vfsCacheMode: off
+    premount:
+      host: /mnt/bio-raw
+    k8s:
+      pvc: bio-raw-csi

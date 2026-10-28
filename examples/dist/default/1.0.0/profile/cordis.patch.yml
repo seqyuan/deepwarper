@@ -1,0 +1,12 @@
+# DeepWarper default distribution patch.
+# Keep the runtime reproducible: no runtime plugin installation, no session-log
+# upload to DeepSeek. These rows exist in the shipped base/web bundles.
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: plugin-manager
+  disabled: true
+- id: ui-plugin-manager
+  disabled: true
+- id: tool-plugin-manager
+  disabled: true

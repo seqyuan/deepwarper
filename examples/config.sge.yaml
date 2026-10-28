@@ -1,0 +1,129 @@
+# DeepWarper SGE site configuration.
+#
+# Every site-specific value lives here; no queue, path, image or endpoint is
+# hardcoded in Go. Placeholders use the documented defaults — fill in the paths
+# for your site before running `dw serve -c examples/config.sge.yaml`.
+#
+# `dw doctor -c <this file>` reports what is missing; the SGE-specific checks
+# only look binaries up on PATH and never submit a job, so it is safe to run on a
+# login node or a laptop.
+
+server:
+  listen: 0.0.0.0:7658
+  # Must be on the shared filesystem that compute nodes can read: the job writes
+  # its state into <dataDir>/control/<id>.
+  dataDir: /data/dw/data
+
+routing:
+  mode: host
+  hostSuffix: dsh.example.com
+  publicScheme: https
+
+platform:
+  # The platform calls POST /api/platform/launch server-to-server.
+  tokenFile: /etc/deepwarper/secrets/platform_token
+  ticketTTL: 60s
+  sessionTTL: 12h
+
+runtime:
+  default: sge
+  defaultDistribution: default
+  # Paths here are *host* paths on the login node (the control plane).
+  dshBin: /opt/dw/bin/dsh
+  dwBin: /opt/dw/bin/dw
+  readyTimeout: 90s
+  scanInterval: 30s
+  heartbeat: 30s
+
+  sge:
+    # Scheduler clients. A site whose login node is not a submit host can point
+    # these at wrapper scripts that ssh to the submit host; they are resolved on
+    # PATH at call time, never at config load.
+    qsub: qsub
+    qstat: qstat
+    qdel: qdel
+    qalter: qalter
+    extraQsubArgs: []
+
+    # -q is omitted when empty (cluster default queue).
+    queue: batch.q
+    # -pe <pe> <slots>. Required: a service needs at least one slot and SGE
+    # rejects an unknown parallel environment.
+    pe: smp
+    peAccounting: cores          # cores | threads
+    threadsPerCore: 1            # threads mode only
+    project: ""                  # -P, many sites gate fair-share on it
+    gpuResourceFlag: gpu         # "-l gpu=<n>"; "none" disables the request
+
+    # Job scripts and the control directory root, both on the shared filesystem.
+    # rendezvousDir must contain <server.dataDir>/control, otherwise the job
+    # writes where the login node does not read (rejected at config load).
+    submitDir: /data/dw/sge/submit
+    rendezvousDir: /data/dw
+
+    # 0 = a queued job may wait forever (the default: a queue wait is not an
+    # error, and `queued: position N` is what the user sees).
+    queueTimeout: 0s
+    # qstat + rendezvous cadence, also the fast reconcile tick.
+    pollEvery: 2s
+    # How long Ensure blocks before returning a `queued` record. 0 keeps the
+    # platform request fast; the fast tick promotes the instance.
+    launchWait: 0s
+
+    ssh: ssh
+    sshUser: ""                  # empty = the current user
+    sshArgs:
+      - "-i"
+      - "/etc/deepwarper/secrets/sge_id_ed25519"
+      - "-o"
+      - "UserKnownHostsFile=/etc/deepwarper/secrets/known_hosts"
+    # tunnel makes the compute node's loopback reachable on the login node.
+    # directDial is the opposite mode (same host only) and cannot be combined.
+    tunnel: true
+    directDial: false
+    tunnelReadyTimeout: 30s
+
+    # Paths below are *inside* the container on a compute node.
+    apptainerImage: /data/dw/images/dw-runtime.sif
+    containerArgs: ["--containall", "--cleanenv", "--no-home"]
+    homeBox: /home/dsh
+    workspaceBox: /workspace
+    distBox: /opt/dw/dist
+    dwBox: /usr/local/bin/dw
+    dshBox: /opt/dw/bin/dsh
+    # Extra container binds: one --bind per concrete path, never a parent dir.
+    extraBinds: []
+
+    # h_rt renewal via `qalter` (restating h_vmem, which qalter replaces).
+    # renewBefore expires 0 = renewal off; renewFor 0 = use the dist walltime.
+    renewBefore: 20m
+    renewFor: 2h
+    warnBefore: 30m
+    # Off by default on SGE: the ceiling is h_rt and renewal exists so that an
+    # idle instance does not have to be reaped. `queued`/`suspended` instances
+    # are never reaped.
+    idleReap: false
+    # h_vmem floor per slot. h_vmem is RLIMIT_AS, and a container runtime plus
+    # Node/V8 reserve a lot of virtual address space.
+    minHVmemPerSlot: 4Gi
+
+quotas:
+  maxInstancesPerUser: 1
+  maxCPUPerUser: 16
+  maxMemoryPerUser: 64Gi
+  maxWalltime: 24h
+
+distributions:
+  default:
+    name: default
+    version: 1.0.0
+    profileName: default
+    # Host path of the materialised *profile* directory. It is bound read-only
+    # at the same absolute path inside the container so the per-user
+    # profiles/<dist>/node_modules symlink resolves identically on both sides.
+    path: /data/dw/dist/default/1.0.0/profile
+    defaults:
+      cpu: 2
+      memory: 4Gi
+      walltime: 8h
+      idleTTL: 30m

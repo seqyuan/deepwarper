@@ -1,0 +1,19 @@
+# build output
+/dw
+/dw-local
+poc-data/
+dw-data/
+*.log
+
+# runtime state
+/data/
+/tmp/
+
+# editor
+.DS_Store
+
+# release artifacts
+/dist/
+
+# private planning notes (kept outside the public repo)
+/plans/

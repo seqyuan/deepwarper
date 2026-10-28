@@ -1,0 +1,60 @@
+# DeepWarper local single-machine mode (POC/production-shaped).
+# Every site-specific value lives here; no paths/ports are hardcoded in Go.
+
+server:
+  listen: 127.0.0.1:7658
+  dataDir: /tmp/dw-prod
+
+routing:
+  mode: host
+  hostSuffix: localhost
+  publicScheme: http
+
+platform:
+  token: poc-token
+  ticketTTL: 60s
+  sessionTTL: 12h
+
+runtime:
+  default: local
+  defaultDistribution: default
+  dshBin: /opt/dw/bin/dsh
+  dwBin: /usr/local/bin/dw
+  readyTimeout: 90s
+  scanInterval: 30s
+  heartbeat: 30s
+  local:
+    portRange: [20000, 30000]
+    # auto | systemd | prlimit | none
+    # auto prefers a systemd user unit (real cgroup limits) and falls back to
+    # prlimit, then to a plain child. `systemd` fails loudly if unavailable.
+    limiter: auto
+    # auto | always | never. never disables the systemd probe entirely.
+    systemdUser: auto
+    # Per-unit cgroup task cap. 0 means the default (512).
+    tasksMax: 512
+    # Budget for the systemd-run client and the first unit status poll.
+    systemdStartTimeout: 10s
+    # TimeoutStopSec= and the client-side stop polling budget.
+    stopGrace: 20s
+    # log = StandardOutput/StandardError=append:<log> (default)
+    # journal = leave the unit's stdio to journald
+    unitStdio: log
+    # Cumulative RLIMIT_CPU for the prlimit fallback. 0 = do not set it:
+    # a long-lived service must not die after CPU*3600 seconds of CPU time.
+    prlimitCPUSeconds: 0
+
+quotas:
+  maxInstancesPerUser: 1
+
+distributions:
+  default:
+    name: default
+    version: 1.0.0
+    profileName: default
+    path: dist/default/1.0.0/profile
+    defaults:
+      cpu: 2
+      memory: 4Gi
+      walltime: 8h
+      idleTTL: 30m
