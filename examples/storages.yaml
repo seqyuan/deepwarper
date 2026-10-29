@@ -14,7 +14,7 @@ roots:
 
   - id: bio-raw
     type: bucket
-    provider: fuse                 # fuse（首发）| premount | csi
+    provider: fuse                 # rclone FUSE，或 premount 到已有目录
     uri: tos://bio-raw             # 也支持 s3://...
     endpoint: tos-s3-cn-beijing.volces.com
     region: cn-beijing
@@ -27,5 +27,3 @@ roots:
       vfsCacheMode: off
     premount:
       host: /mnt/bio-raw
-    k8s:
-      pvc: bio-raw-csi

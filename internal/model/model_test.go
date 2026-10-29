@@ -2,12 +2,9 @@ package model
 
 import "testing"
 
-// TestStateActiveIncludesSchedulerStates pins the set the manager treats as "a
-// record we must keep looking after". queued and suspended must be in it: a job
-// waiting for a slot or paused by the scheduler is still the user's work, and a
-// record that is not active would be ignored by Reconcile forever.
-func TestStateActiveIncludesSchedulerStates(t *testing.T) {
-	active := []State{StatePending, StateStarting, StateQueued, StateSuspended, StateRunning, StateStopping}
+// TestStateActive pins the records Reconcile keeps looking after.
+func TestStateActive(t *testing.T) {
+	active := []State{StatePending, StateStarting, StateRunning, StateStopping}
 	for _, s := range active {
 		if !s.Active() {
 			t.Fatalf("%s must be active", s)
@@ -26,17 +23,13 @@ func TestStateActiveIncludesSchedulerStates(t *testing.T) {
 	}
 }
 
-func TestInstanceSchedulerFieldsRoundTrip(t *testing.T) {
+func TestInstanceRecordFields(t *testing.T) {
 	inst := Instance{
-		BackendRef:     "12345",
-		Backend:        "sge",
-		Node:           "node001",
-		JobPort:        41002,
-		RemoteEndpoint: "node001:41002",
+		BackendRef: "dw-alice.service",
+		Backend:    "local",
+		Node:       "host",
 	}
-	// The field names are the record's schema: renaming them silently drops data
-	// for running instances.
-	if inst.BackendRef != "12345" || inst.RemoteEndpoint != "node001:41002" || inst.JobPort != 41002 {
+	if inst.BackendRef != "dw-alice.service" || inst.Backend != "local" || inst.Node != "host" {
 		t.Fatalf("record: %+v", inst)
 	}
 }

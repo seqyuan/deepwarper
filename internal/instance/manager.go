@@ -21,7 +21,6 @@ import (
 	"github.com/seqyuan/deepwarper/internal/rendezvous"
 	"github.com/seqyuan/deepwarper/internal/runtime"
 	"github.com/seqyuan/deepwarper/internal/runtime/local"
-	"github.com/seqyuan/deepwarper/internal/runtime/sge"
 	"github.com/seqyuan/deepwarper/internal/state"
 )
 
@@ -72,31 +71,8 @@ func New(cfg *config.Config) (*Manager, error) {
 		}
 	}
 	pool := newPortPool(cfg)
-	backends := map[string]runtime.Backend{
-		"local": local.New(LocalOptions(cfg)),
-	}
-	if cfg.Runtime.SGE.IsEnabled() {
-		backend, err := sge.FromConfig(cfg)
-		if err != nil {
-			// A configured-but-broken backend is a config bug, not something to
-			// paper over: a silent fallback would run heavy work on a login node.
-			return nil, err
-		}
-		backend.SetPorts(pool)
-		backends["sge"] = backend
-	}
-	want := strings.ToLower(strings.TrimSpace(cfg.Runtime.Default))
-	if want == "" {
-		want = "local"
-	}
-	active, ok := backends[want]
-	if !ok {
-		if want == "sge" {
-			return nil, errors.New("runtime.default is sge but runtime.sge is absent or disabled")
-		}
-		return nil, fmt.Errorf("runtime.default %q is not a known backend (want local|sge)", cfg.Runtime.Default)
-	}
-	return newManagerWithBackends(cfg, pool, backends, active)
+	backend := local.New(LocalOptions(cfg))
+	return newManagerWithBackends(cfg, pool, map[string]runtime.Backend{"local": backend}, backend)
 }
 
 func newPortPool(cfg *config.Config) *ports.Pool {
@@ -205,7 +181,10 @@ func (m *Manager) Ensure(ctx context.Context, req Request) (*model.Instance, err
 	if err := distribution.Materialize(home, dist); err != nil {
 		return nil, fmt.Errorf("materialize profile: %w", err)
 	}
-	if err := ensureDefaultWorkspaceLink(workspace); err != nil {
+	if err := m.prepareHome(home, req.User); err != nil {
+		return nil, fmt.Errorf("prepare home: %w", err)
+	}
+	if err := ensureDefaultWorkspaceLink(workspace, workspace); err != nil {
 		return nil, fmt.Errorf("default workspace link: %w", err)
 	}
 
@@ -234,12 +213,6 @@ func (m *Manager) Ensure(ctx context.Context, req Request) (*model.Instance, err
 	controlDir := filepath.Join(m.cfg.Server.DataDir, "control", id)
 	unitName := "dw-" + slug + "-" + inc[:8] + ".service"
 	logPath := filepath.Join(m.cfg.Server.DataDir, "logs", id+".log")
-	if backendName == "sge" {
-		// A job script's name is not a unit name, and the job log must live
-		// inside the one directory the container is guaranteed to see.
-		unitName = strings.TrimSuffix(unitName, ".service")
-		logPath = filepath.Join(controlDir, "job.log")
-	}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		return nil, err
 	}
@@ -306,6 +279,10 @@ func (m *Manager) Ensure(ctx context.Context, req Request) (*model.Instance, err
 		Walltime:     inst.Walltime,
 		GPU:          inst.GPU,
 	}
+	if err := m.attachSandbox(&spec, req.User); err != nil {
+		m.fail(inst, err)
+		return nil, err
+	}
 	h, err := backend.Start(ctx, spec)
 	if err != nil {
 		m.fail(inst, err)
@@ -316,45 +293,17 @@ func (m *Manager) Ensure(ctx context.Context, req Request) (*model.Instance, err
 	inst.PIDStart = h.PIDStart()
 	inst.Limiter = h.Limiter()
 	inst.Command = h.Command()
-	if backendName == "sge" {
-		// The job id is the only identity that survives this process; the pid
-		// lives on a compute node.
-		inst.BackendRef = h.Ref()
-	} else if h.Limiter() == "systemd" {
+	if h.Limiter() == "systemd" {
 		inst.BackendRef = h.Ref()
 	} else {
 		inst.BackendRef = ""
 	}
 	inst.StartedAt = time.Now().UTC()
-	if lh, ok := h.(runtime.LeaseHandle); ok {
-		inst.LeaseExpiresAt = lh.LeaseExpiresAt(inst.StartedAt)
-	}
 	if err := m.store.Save(inst); err != nil {
 		_ = h.Stop(ctx)
 		return nil, err
 	}
-	// A scheduler-backed backend decides for itself whether Ensure may block: on
-	// SGE a job can wait hours for a slot, and a platform request must not.
-	budget := m.cfg.ReadyTimeout()
-	if p, ok := backend.(runtime.Policy); ok {
-		budget = p.LaunchBudget()
-	}
-	ready, err := h.Endpoint(ctx, budget)
-	if errors.Is(err, runtime.ErrNotYetRunning) {
-		// Submitted, not placed. Return a queued record: the platform gets its
-		// ticket immediately and the fast tick promotes the instance.
-		inst.State = model.StateQueued
-		inst.Error = "queued"
-		if err := m.store.Save(inst); err != nil {
-			return nil, err
-		}
-		portOK = true
-		m.mu.Lock()
-		m.handles[id] = h
-		m.last[id] = inst.StartedAt
-		m.mu.Unlock()
-		return inst, nil
-	}
+	ready, err := h.Endpoint(ctx, m.cfg.ReadyTimeout())
 	if err != nil {
 		_ = h.Stop(ctx)
 		m.fail(inst, err)
@@ -363,22 +312,10 @@ func (m *Manager) Ensure(ctx context.Context, req Request) (*model.Instance, err
 	inst.State = model.StateRunning
 	inst.Endpoint = fmt.Sprintf("%s:%d", ready.Host, ready.Port)
 	inst.Node = ready.Node
-	// A backend may publish a port the control plane did not allocate (SGE's
-	// directDial mode dials the job host itself); the pooled port was never
-	// bound, so it is released rather than leaked.
 	if ready.Port > 0 && ready.Port != inst.Port {
 		m.ports.Release(inst.Port)
 		inst.Port = ready.Port
 		_ = m.ports.Reserve(inst.Port, id)
-	}
-	// The far side of the tunnel is worth keeping: it is what an operator needs
-	// to look at qstat/ssh by hand.
-	if d, ok := h.(runtime.EndpointDescriber); ok {
-		if node, jobPort := d.DescribeEndpoint(); node != "" && jobPort > 0 {
-			inst.Node = node
-			inst.JobPort = jobPort
-			inst.RemoteEndpoint = fmt.Sprintf("%s:%d", node, jobPort)
-		}
 	}
 	_ = os.Remove(filepath.Join(m.cfg.Server.DataDir, "runtime", id, "dsh-session.json"))
 	inst.ReadyAt = time.Now().UTC()
@@ -415,7 +352,7 @@ func (m *Manager) stopLocked(ctx context.Context, inst *model.Instance) error {
 	inst.State = model.StateStopping
 	_ = m.store.Save(inst)
 	if err := m.stopBackend(ctx, inst); err != nil {
-		// A failed qdel/systemctl stop is not a stopped instance. Keep the
+		// A failed stop is not a stopped instance. Keep the
 		// record active and the port reserved so the next tick can retry; the
 		// caller sees the real error instead of a silent leak.
 		inst.Error = "stop failed: " + err.Error()
@@ -480,6 +417,28 @@ func (m *Manager) ByHost(host string) (*model.Instance, error) {
 	return nil, nil
 }
 
+// ByUser returns the user's running instance, or another of their records
+// when none is running. A user with no record yields nil, nil.
+func (m *Manager) ByUser(user string) (*model.Instance, error) {
+	list, err := m.store.List()
+	if err != nil {
+		return nil, err
+	}
+	var fallback *model.Instance
+	for _, inst := range list {
+		if inst.User != user {
+			continue
+		}
+		if inst.State == model.StateRunning {
+			return inst, nil
+		}
+		if fallback == nil {
+			fallback = inst
+		}
+	}
+	return fallback, nil
+}
+
 func (m *Manager) Touch(inst *model.Instance) {
 	m.mu.Lock()
 	m.last[inst.ID] = time.Now().UTC()
@@ -518,7 +477,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		// A port is only held once the instance can serve: reserving one for a
 		// launch that has not bound it yet would starve the pool.
 		switch inst.State {
-		case model.StateQueued, model.StateSuspended, model.StateRunning:
+		case model.StateRunning:
 			if inst.Port > 0 {
 				_ = m.ports.Reserve(inst.Port, inst.ID)
 			}
@@ -531,15 +490,7 @@ func (m *Manager) reconcileOne(ctx context.Context, inst *model.Instance, now ti
 	backend := m.backendFor(inst)
 	obs, probeErr := backend.Probe(ctx, inst)
 	if probeErr == nil && obs.Gone() {
-		// A scheduler's explicit failure state (SGE Eqw and friends) is a
-		// decision, not a clean stop: keep it visible as `failed` so the user
-		// sees why the job never ran. A plain process/unit that disappeared is
-		// settled as stopped (the agent may have exited cleanly).
-		if obs.Phase == runtime.PhaseFailed && schedulerBacked(backend) {
-			m.settleFailed(ctx, inst, obs.Describe(), now)
-		} else {
-			m.settleStopped(inst, obs.Describe(), now)
-		}
+		m.settleStopped(inst, obs.Describe(), now)
 		return
 	}
 	if probeErr == nil && obs.Alive() {
@@ -551,117 +502,34 @@ func (m *Manager) reconcileOne(ctx context.Context, inst *model.Instance, now ti
 			inst.PIDStart = obs.PIDStart
 			_ = m.store.Save(inst)
 		}
-		if obs.Node != "" && obs.Node != inst.Node {
-			inst.Node = obs.Node
-			_ = m.store.Save(inst)
-		}
 	}
 
-	if probeErr == nil {
-		switch obs.Phase {
-		case runtime.PhaseQueued:
-			// Waiting for a slot is a legitimate place to be for hours. The only
-			// timeout is the explicitly configured queueTimeout.
-			if m.queueExpired(inst, now) {
-				if err := m.stopBackend(ctx, inst); err != nil {
-					inst.Error = "queue timeout, stop failed: " + err.Error()
-					_ = m.store.Save(inst)
-					return
-				}
-				m.ports.Release(inst.Port)
-				inst.State = model.StateFailed
-				inst.Error = fmt.Sprintf("job did not start within %s (still queued)", m.cfg.Runtime.SGE.QueueTimeout)
-				inst.EndedAt = now
-				_ = m.store.Save(inst)
-				return
-			}
-			if inst.State != model.StateQueued || obs.Note != inst.Error {
-				inst.State = model.StateQueued
-				inst.Error = obs.Note
-				_ = m.store.Save(inst)
-			}
-			return
-		case runtime.PhaseSuspended:
-			// Suspended is alive: SGE paused the job and may resume it. Do not
-			// settle, do not reap, do not resubmit.
-			if inst.State != model.StateSuspended || obs.Note != inst.Error {
-				inst.State = model.StateSuspended
-				inst.Error = obs.Note
-				_ = m.store.Save(inst)
-			}
-			return
-		}
-	}
-
-	if inst.State == model.StateStarting && !schedulerBacked(backend) && m.stuckStarting(inst, now) {
+	if inst.State == model.StateStarting && m.stuckStarting(inst, now) {
 		m.failStuckStarting(ctx, inst, now)
 		return
 	}
-	// Promote a starting or queued instance once its own record says ready. This
-	// is the restart path too: Adopt re-establishes reachability instead of
-	// trusting a dead route from an earlier control plane.
-	if inst.State == model.StateStarting || inst.State == model.StateQueued {
+	if inst.State == model.StateStarting {
 		if probeErr == nil && obs.Alive() {
-			if _, err := m.promote(ctx, inst); err != nil && !errors.Is(err, runtime.ErrNotYetRunning) {
+			if _, err := m.promote(inst); err != nil {
 				m.logfTo("promote %s: %v", inst.ID, err)
 			}
 		}
 	}
 }
 
-// schedulerBacked reports whether the backend's own scheduler owns placement and
-// the lifecycle ceiling. The stuck-starting escape hatch does not apply there: a
-// job can sit in a queue for six hours and is governed by queueTimeout and h_rt.
-func schedulerBacked(b runtime.Backend) bool {
-	_, ok := b.(runtime.Policy)
-	return ok
-}
-
-// promote is the single implementation of "observe ready.json -> make the
-// endpoint reachable -> persist". Ensure uses the handle; this path uses Adopt.
-func (m *Manager) promote(ctx context.Context, inst *model.Instance) (bool, error) {
+// promote records a ready.json that belongs to this incarnation.
+func (m *Manager) promote(inst *model.Instance) (bool, error) {
 	r, err := rendezvous.ReadReady(inst.ControlDir)
 	if err != nil || r.Incarnation != inst.Incarnation || r.State != "ready" || r.Port <= 0 {
 		return false, nil
 	}
 	host, port := r.Host, r.Port
-	backend := m.backendFor(inst)
-	m.mu.Lock()
-	handle := m.handles[inst.ID]
-	m.mu.Unlock()
-	switch {
-	case handle != nil && schedulerBacked(backend):
-		// This process submitted the job (it is queued, not adopted). Only a
-		// scheduler-backed handle may be polled with a zero budget; the local one
-		// would block for the full ready timeout inside a reconcile tick.
-		ready, err := handle.Endpoint(ctx, 0)
-		if err != nil {
-			return false, err
-		}
-		host, port = ready.Host, ready.Port
-	case handle == nil:
-		if adopter, ok := backend.(runtime.Adopter); ok {
-			h, p, adoptErr := adopter.Adopt(ctx, inst)
-			if adoptErr != nil {
-				return false, adoptErr
-			}
-			host, port = h, p
-		}
-	}
-	if handle != nil {
-		if d, ok := handle.(runtime.EndpointDescriber); ok {
-			if node, jobPort := d.DescribeEndpoint(); node != "" && jobPort > 0 {
-				inst.Node = node
-				inst.JobPort = jobPort
-				inst.RemoteEndpoint = fmt.Sprintf("%s:%d", node, jobPort)
-			}
-		}
+	if r.Node != "" {
+		inst.Node = r.Node
 	}
 	inst.State = model.StateRunning
 	inst.Endpoint = fmt.Sprintf("%s:%d", host, port)
 	if port > 0 && port != inst.Port {
-		// Same rule as Ensure: an endpoint the control plane did not allocate
-		// replaces the pooled port instead of leaving it reserved for nothing.
 		m.ports.Release(inst.Port)
 		inst.Port = port
 		_ = m.ports.Reserve(inst.Port, inst.ID)
@@ -675,20 +543,6 @@ func (m *Manager) promote(ctx context.Context, inst *model.Instance) (bool, erro
 	return true, nil
 }
 
-// settleStopped records a confirmed death and releases everything the instance
-// held.
-func (m *Manager) settleFailed(ctx context.Context, inst *model.Instance, reason string, now time.Time) {
-	_ = m.stopBackend(ctx, inst)
-	inst.State = model.StateFailed
-	inst.Error = reason
-	inst.EndedAt = now
-	_ = m.store.Save(inst)
-	m.ports.Release(inst.Port)
-	m.mu.Lock()
-	delete(m.handles, inst.ID)
-	m.mu.Unlock()
-}
-
 func (m *Manager) settleStopped(inst *model.Instance, reason string, now time.Time) {
 	inst.State = model.StateStopped
 	inst.Error = reason
@@ -700,22 +554,6 @@ func (m *Manager) settleStopped(inst *model.Instance, reason string, now time.Ti
 	m.mu.Unlock()
 }
 
-// queueExpired reports whether an explicitly configured queueTimeout has
-// elapsed. The default is 0 (wait forever): a slot wait is not an error.
-func (m *Manager) queueExpired(inst *model.Instance, now time.Time) bool {
-	s := m.cfg.Runtime.SGE
-	if s == nil || inst.StartedAt.IsZero() {
-		return false
-	}
-	d, err := time.ParseDuration(s.QueueTimeout)
-	if err != nil || d <= 0 {
-		return false
-	}
-	return now.Sub(inst.StartedAt) > d
-}
-
-// stuckStarting is the escape hatch for a wedged launch: Ensure would return
-// this active record forever, locking the user out.
 func (m *Manager) stuckStarting(inst *model.Instance, now time.Time) bool {
 	if inst.StartedAt.IsZero() {
 		return false
@@ -748,16 +586,7 @@ func (m *Manager) Sweep(ctx context.Context) error {
 	}
 	now := time.Now().UTC()
 	for _, inst := range list {
-		// Queued and suspended instances are not idle, they are waiting or
-		// paused. Killing them would force a re-queue for no benefit.
 		if inst.State != model.StateRunning {
-			continue
-		}
-		backend := m.backendFor(inst)
-		if policy, ok := backend.(runtime.Policy); ok && !policy.IdleReapAllowed() {
-			// On a scheduler the lifecycle ceiling is h_rt, and renewal exists so
-			// that an idle instance does not have to be reaped. Sites can still
-			// opt in with sge.idleReap: true.
 			continue
 		}
 		ttl, err := time.ParseDuration(inst.IdleTTL)
@@ -773,68 +602,29 @@ func (m *Manager) Sweep(ctx context.Context) error {
 	return nil
 }
 
-// RenewTick extends scheduler leases and warns about the ones it cannot move.
-// Every step is optional: a backend without Renewer or LeaseWarner is skipped,
-// never guessed at.
-func (m *Manager) RenewTick(ctx context.Context) error {
-	list, err := m.store.List()
-	if err != nil {
-		return err
-	}
-	for _, inst := range list {
-		if inst.State != model.StateRunning && inst.State != model.StateSuspended {
-			continue
-		}
-		backend := m.backendFor(inst)
-		if renewer, ok := backend.(runtime.Renewer); ok {
-			renewed, renewErr := renewer.Renew(ctx, inst)
-			if renewErr != nil {
-				// A renewal failure is a countdown, not a kill.
-				m.logfTo("renew %s: %v", inst.ID, renewErr)
-			} else if renewed {
-				if err := m.store.Save(inst); err != nil {
-					m.logfTo("renew %s: save: %v", inst.ID, err)
-				}
-				m.logfTo("renewed %s until %s", inst.ID, inst.LeaseExpiresAt.UTC().Format(time.RFC3339))
-			}
-		}
-		warner, ok := backend.(runtime.LeaseWarner)
-		if !ok {
-			continue
-		}
-		if !inst.LeaseWarnedAt.IsZero() {
-			continue // already warned for this lease window; renewal re-arms it
-		}
-		if msg, warn := warner.LeaseWarning(inst); warn {
-			inst.LeaseWarnedAt = time.Now().UTC()
-			inst.Error = msg
-			if err := m.store.Save(inst); err != nil {
-				m.logfTo("lease warn %s: save: %v", inst.ID, err)
-			}
-			m.logfTo("lease %s: %s", inst.ID, msg)
-		}
-	}
-	return nil
-}
-
 func (m *Manager) Shutdown(ctx context.Context) {
 	// Deliberately do not stop instances: a control-plane restart must adopt
 	// them. Only explicit Stop/Sweep stops dsh.
 }
 
-func ensureDefaultWorkspaceLink(workspace string) error {
+func ensureDefaultWorkspaceLink(workspace, target string) error {
 	dir := filepath.Join(workspace, "deepseek-harness")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	link := filepath.Join(dir, "default-workspace")
 	if fi, err := os.Lstat(link); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
+		if fi.Mode()&os.ModeSymlink == 0 {
 			return nil
 		}
-		return nil
+		if got, err := os.Readlink(link); err == nil && got == target {
+			return nil
+		}
+		if err := os.Remove(link); err != nil {
+			return err
+		}
 	}
-	return os.Symlink(workspace, link)
+	return os.Symlink(target, link)
 }
 
 func publicAuthority(slug, suffix, port, scheme string) string {

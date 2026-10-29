@@ -7,8 +7,8 @@
 //   - dsh's launch-token broker: the browser never sees dsh's ?token=
 //   - persistence: stopping an instance keeps its home and profile
 //
-// It is not the production control plane. There are no containers, no SGE,
-// no resource limits, and the ticket/session stores are in memory.
+// It is not the production control plane. It has no resource limits, and the
+// ticket/session stores are in memory.
 package main
 
 import (

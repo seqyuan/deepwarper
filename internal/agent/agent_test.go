@@ -177,9 +177,8 @@ func TestSIGTERMDuringReadyWaitStopsDsh(t *testing.T) {
 	}
 }
 
-// TestPortZeroPublishesChosenPort is the SGE contract: the control plane sends
-// port 0 because only the job host knows which loopback port is free, and the
-// chosen port must be published in ready.json.
+// TestPortZeroPublishesChosenPort: port 0 asks this process to pick a free
+// loopback port and publish it in ready.json.
 func TestPortZeroPublishesChosenPort(t *testing.T) {
 	root := t.TempDir()
 	for _, d := range []string{"home", "ws", "control", "logs"} {
@@ -229,9 +228,231 @@ func TestPortZeroPublishesChosenPort(t *testing.T) {
 	}
 }
 
-// TestPortZeroIsPickedOnThisHost is the SGE contract: the control plane sends
-// port 0 because only the job host knows which loopback port is free, and the
-// chosen port must be published in ready.json.
+func TestPrefixCommand(t *testing.T) {
+	spec := Spec{
+		DshBin:      "/opt/dw/bin/dsh",
+		Profile:     "default",
+		Port:        23456,
+		PublicURL:   "http://alice.localhost/",
+		TrustedHost: "alice.localhost",
+	}
+	looked := false
+	argv, err := prefixCommand(spec, func(string) (string, error) {
+		looked = true
+		return "", os.ErrNotExist
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if looked {
+		t.Fatal("lookPath called without bwrap argv")
+	}
+	if argv[0] != spec.DshBin || !strings.Contains(strings.Join(argv, " "), "--profile default") {
+		t.Fatalf("plain argv: %#v", argv)
+	}
+
+	spec.BwrapArgv = []string{"bwrap", "--bind", "/var/ws", "/workspace", "--", "ignored"}
+	_, err = prefixCommand(spec, func(string) (string, error) { return "", os.ErrNotExist })
+	if err == nil || !strings.Contains(err.Error(), "bwrap") {
+		t.Fatalf("missing bwrap: %v", err)
+	}
+	argv, err = prefixCommand(spec, func(name string) (string, error) {
+		if name == "bwrap" {
+			return "/usr/bin/bwrap", nil
+		}
+		return "", os.ErrNotExist
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if argv[0] != "/usr/bin/bwrap" {
+		t.Fatalf("argv prefix: %#v", argv)
+	}
+	if !strings.Contains(strings.Join(argv, " "), "--bind /var/ws /workspace -- "+spec.DshBin) {
+		t.Fatalf("prefixed argv: %#v", argv)
+	}
+	if strings.Contains(strings.Join(argv, " "), "ignored") {
+		t.Fatalf("stale command kept: %#v", argv)
+	}
+
+	spec.PatchPath = "/data/dw/control/alice/runtime.patch.yml"
+	spec.BwrapArgv = []string{"bwrap", "--dev-bind", "/dev/fuse", "/dev/fuse", "--", "/bin/sh", "/dw/control/dw-wrap.sh"}
+	argv, err = prefixCommand(spec, func(name string) (string, error) {
+		if name == "bwrap" {
+			return "/usr/bin/bwrap", nil
+		}
+		return "", os.ErrNotExist
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(argv, " ")
+	if !strings.Contains(text, "/bin/sh /dw/control/dw-wrap.sh "+spec.DshBin) {
+		t.Fatalf("wrapper must run before dsh: %s", text)
+	}
+	if !strings.Contains(text, "--patch /dw/control/runtime.patch.yml") {
+		t.Fatalf("patch path must be inside the sandbox: %s", text)
+	}
+	if strings.Contains(text, spec.PatchPath) {
+		t.Fatalf("host patch path leaked into the sandbox command: %s", text)
+	}
+}
+
+func TestSandboxEnvDropsHostSecrets(t *testing.T) {
+	got := sandboxEnv(
+		[]string{"PATH=/usr/bin", "HOME=/root", "DW_PASSWORD=s3cret", "LANG=C.UTF-8", "RANDOM=1"},
+		[]string{"PATH=/opt/dw/bin:/opt/moniforge/bin", "HOME=/home/dsh", "DSH_HOME=/home/dsh"},
+	)
+	text := strings.Join(got, "\n")
+	if strings.Contains(text, "DW_PASSWORD") || strings.Contains(text, "s3cret") || strings.Contains(text, "RANDOM=") {
+		t.Fatalf("host env leaked: %#v", got)
+	}
+	for _, want := range []string{"PATH=/opt/dw/bin:/opt/moniforge/bin", "HOME=/home/dsh", "DSH_HOME=/home/dsh", "LANG=C.UTF-8"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %s in %#v", want, got)
+		}
+	}
+}
+
+func TestResolveRcloneUsesLookPath(t *testing.T) {
+	argv, err := resolveRcloneArgv([]string{"rclone", "mount", "r:b/p", "/mnt"}, func(name string) (string, error) {
+		if name == "rclone" {
+			return "/usr/bin/rclone", nil
+		}
+		return "", os.ErrNotExist
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if argv[0] != "/usr/bin/rclone" {
+		t.Fatalf("argv: %#v", argv)
+	}
+}
+
+func TestRunRewritesWrapperAfterClear(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"home", "ws", "control", "logs"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	control := filepath.Join(root, "control")
+	wrapPath := filepath.Join(control, "dw-wrap.sh")
+	if err := os.WriteFile(wrapPath, []byte("stale wrapper\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := rendezvous.Clear(control); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(wrapPath); !os.IsNotExist(err) {
+		t.Fatal("clear must remove dw-wrap.sh")
+	}
+	const marker = "FRESH-WRAPPER"
+	dsh := filepath.Join(root, "dsh")
+	if err := os.WriteFile(dsh, []byte("#!/bin/sh\necho \"dsh web: http://127.0.0.1:1/?token=abc123\"\nsleep 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bwrap := filepath.Join(root, "bwrap")
+	script := "#!/bin/sh\n" +
+		"if ! grep -q " + shellQuote(marker) + " " + shellQuote(wrapPath) + "; then\n" +
+		"  echo wrapper missing >&2\n  exit 1\nfi\n" +
+		"exec " + shellQuote(dsh) + "\n"
+	if err := os.WriteFile(bwrap, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := Spec{
+		InstanceID:   "alice-default",
+		Incarnation:  "inc1",
+		Profile:      "default",
+		DshBin:       dsh,
+		Home:         filepath.Join(root, "home"),
+		Workspace:    filepath.Join(root, "ws"),
+		ControlDir:   control,
+		LogPath:      filepath.Join(root, "logs", "alice.log"),
+		PublicURL:    "http://alice.localhost/",
+		TrustedHost:  "alice.localhost",
+		Port:         23456,
+		ReadyTimeout: "5s",
+		BwrapArgv:    []string{bwrap, "--", "/bin/sh", "/dw/control/dw-wrap.sh"},
+		Wrapper:      "#!/bin/sh\n# " + marker + "\n",
+	}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(root, "spec.json")
+	if err := os.WriteFile(specPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := Run(t.Context(), specPath); code != 0 {
+		t.Fatalf("exit code: %d", code)
+	}
+	got, err := os.ReadFile(wrapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), marker) {
+		t.Fatalf("wrapper was not rewritten before bwrap: %s", got)
+	}
+}
+
+func TestRunUsesBwrapPrefix(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"home", "ws", "control", "logs"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logPath := filepath.Join(root, "argv.txt")
+	bwrap := filepath.Join(root, "bwrap")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(logPath) + "\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 1\n"
+	if err := os.WriteFile(bwrap, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dsh := filepath.Join(root, "dsh")
+	if err := os.WriteFile(dsh, []byte("#!/bin/sh\necho \"dsh web: http://127.0.0.1:1/?token=abc123\"\nsleep 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := Spec{
+		InstanceID:   "alice-default",
+		Incarnation:  "inc1",
+		Profile:      "default",
+		DshBin:       dsh,
+		Home:         filepath.Join(root, "home"),
+		Workspace:    filepath.Join(root, "ws"),
+		ControlDir:   filepath.Join(root, "control"),
+		LogPath:      filepath.Join(root, "logs", "alice.log"),
+		PublicURL:    "http://alice.localhost/",
+		TrustedHost:  "alice.localhost",
+		Port:         23456,
+		ReadyTimeout: "5s",
+		BwrapArgv:    []string{bwrap, "--bind", filepath.Join(root, "ws"), "/workspace", "--"},
+	}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(root, "spec.json")
+	if err := os.WriteFile(specPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := Run(t.Context(), specPath); code != 0 {
+		t.Fatalf("exit code: %d", code)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(logged)
+	if !strings.Contains(text, "--bind") || !strings.Contains(text, dsh) {
+		t.Fatalf("bwrap was not prefixed: %s", text)
+	}
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
 func TestPortZeroIsPickedOnThisHost(t *testing.T) {
 	port, err := freeLoopbackPort()
 	if err != nil {

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -20,7 +19,6 @@ import (
 	"github.com/seqyuan/deepwarper/internal/gateway"
 	"github.com/seqyuan/deepwarper/internal/instance"
 	"github.com/seqyuan/deepwarper/internal/runtime/local"
-	"github.com/seqyuan/deepwarper/internal/runtime/sge"
 )
 
 var version = "dev"
@@ -39,6 +37,20 @@ func main() {
 		doctor(os.Args[2:])
 	case "version":
 		fmt.Println(version)
+	case "user":
+		userCmd(os.Args[2:])
+	case "passwd":
+		passwdCmd(os.Args[2:])
+	case "del":
+		delCmd(os.Args[2:])
+	case "mount":
+		mountCmd(os.Args[2:])
+	case "remote":
+		remoteCmd(os.Args[2:])
+	case "catalog":
+		catalogCmd(os.Args[2:])
+	case "plugin":
+		pluginCmd(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -46,7 +58,18 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: dw serve -c config.yaml | dw instance -spec spec.json | dw doctor -c config.yaml | dw version")
+	fmt.Fprintln(os.Stderr, "usage: dw serve -c config.yaml")
+	fmt.Fprintln(os.Stderr, "       dw instance -spec spec.json")
+	fmt.Fprintln(os.Stderr, "       dw doctor -c config.yaml")
+	fmt.Fprintln(os.Stderr, "       dw user [-d dir] <name>")
+	fmt.Fprintln(os.Stderr, "       dw passwd [-d dir] <name>")
+	fmt.Fprintln(os.Stderr, "       dw del [-d dir] <name>")
+	fmt.Fprintln(os.Stderr, "       dw mount add [-d dir] <user> --local host:target:ro|rw")
+	fmt.Fprintln(os.Stderr, "       dw mount add [-d dir] <user> --remote name --prefix p --at target --ro|--rw")
+	fmt.Fprintln(os.Stderr, "       dw remote add [-d dir] <name> --provider tos|s3 --endpoint url --region r --bucket b --credential-file path")
+	fmt.Fprintln(os.Stderr, "       dw catalog add [-d dir] <name> <dir>")
+	fmt.Fprintln(os.Stderr, "       dw plugin enable|disable [-d dir] <user> <name>")
+	fmt.Fprintln(os.Stderr, "       dw version")
 }
 
 func serve(args []string) {
@@ -81,15 +104,7 @@ func serve(args []string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Instances that are not settled yet (a queued job, a launching process) are
-	// re-checked on the fast interval. Without an SGE section the fast interval
-	// is exactly the scan interval, so local behaviour is unchanged.
 	fastEvery := cfg.ScanInterval()
-	if cfg.Runtime.SGE.IsEnabled() {
-		if d, err := time.ParseDuration(cfg.Runtime.SGE.PollEvery); err == nil && d > 0 && d < fastEvery {
-			fastEvery = d
-		}
-	}
 	go func() {
 		ticker := time.NewTicker(fastEvery)
 		defer ticker.Stop()
@@ -114,9 +129,6 @@ func serve(args []string) {
 			case <-ticker.C:
 				if err := mgr.Sweep(ctx); err != nil {
 					logger.Printf("sweep: %v", err)
-				}
-				if err := mgr.RenewTick(ctx); err != nil {
-					logger.Printf("renew: %v", err)
 				}
 			}
 		}
@@ -212,67 +224,30 @@ func doctor(args []string) {
 	fmt.Printf("tasksMax: %d\n", resolved.TasksMax)
 	fmt.Printf("readyTimeout: %s (unit start %s, stopGrace %s, unitStdio=%s)\n",
 		cfg.Runtime.ReadyTimeout, resolved.StartTimeout, resolved.StopGrace, resolved.UnitStdio)
-	if ctx, ok := sgeDoctor(cfg); !ok {
-		problems += ctx
+	if cfg.Runtime.Moniforge == "" {
+		fmt.Println("moniforge: not set")
+	} else if _, err := os.Stat(cfg.Runtime.Moniforge); err != nil {
+		fmt.Printf("moniforge: warning: %v\n", err)
+	} else {
+		fmt.Printf("moniforge: ok (%s)\n", cfg.Runtime.Moniforge)
+	}
+	if cfg.Auth.UsersDir == "" {
+		fmt.Println("users dir: login off")
+	} else {
+		fmt.Printf("users dir: %s\n", cfg.Auth.UsersDir)
+	}
+	for _, name := range []string{"bwrap", "rclone"} {
+		fmt.Print(toolStatus(name, exec.LookPath))
 	}
 	if problems > 0 {
 		os.Exit(1)
 	}
 }
 
-// sgeDoctor reports the SGE section's validity. It never submits anything: a
-// probe job and an ssh reachability check belong to a submit host, not to
-// `dw doctor` on a laptop. It returns the number of problems added.
-func sgeDoctor(cfg *config.Config) (int, bool) {
-	if cfg.Runtime.SGE == nil || !cfg.Runtime.SGE.IsEnabled() {
-		return 0, true
-	}
-	problems := 0
-	backend, err := sge.FromConfig(cfg)
+func toolStatus(name string, look func(string) (string, error)) string {
+	path, err := look(name)
 	if err != nil {
-		fmt.Printf("sge: FAIL %v\n", err)
-		return 1, false
+		return fmt.Sprintf("%s: warning: not found\n", name)
 	}
-	queue := backend.Queue
-	if queue == "" {
-		queue = "(cluster default)"
-	}
-	fmt.Printf("sge: ok (pe=%s slots/cores=%s queue=%s project=%s)\n",
-		backend.PE, backend.PEAccounting, queue, orDefault(backend.Project, "(none)"))
-	fmt.Printf("sge: submitDir=%s rendezvousDir=%s\n", backend.SubmitDir, backend.RendezvousDir)
-	fmt.Printf("sge: image=%s dw=%s dsh=%s home=%s workspace=%s\n",
-		backend.ApptainerImage, backend.DWBox, backend.DSHBox, backend.HomeBox, backend.WorkspaceBox)
-	fmt.Printf("sge: tunnel=%v directDial=%v idleReap=%v renewBefore=%s warnBefore=%s\n",
-		backend.Tunnel, backend.DirectDial, backend.IdleReap,
-		durOrDefault(backend.RenewBefore), durOrDefault(backend.WarnBefore))
-	// Binaries are only looked up, never run: a site may point them at wrapper
-	// scripts that ssh to a submit host, and those do not exist here.
-	for _, b := range []struct{ label, name string }{
-		{"qsub", backend.Qsub},
-		{"qstat", backend.Qstat},
-		{"qdel", backend.Qdel},
-		{"qalter", backend.Qalter},
-		{"ssh", backend.SSH},
-	} {
-		if path, lookErr := exec.LookPath(b.name); lookErr != nil {
-			fmt.Printf("sge %s: not found on PATH (%s) — fine unless this host is the submit host\n", b.label, b.name)
-		} else {
-			fmt.Printf("sge %s: ok (%s)\n", b.label, path)
-		}
-	}
-	return problems, true
-}
-
-func orDefault(s, def string) string {
-	if strings.TrimSpace(s) == "" {
-		return def
-	}
-	return s
-}
-
-func durOrDefault(d time.Duration) string {
-	if d <= 0 {
-		return "off"
-	}
-	return d.String()
+	return fmt.Sprintf("%s: ok (%s)\n", name, path)
 }

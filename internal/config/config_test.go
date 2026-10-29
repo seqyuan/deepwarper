@@ -46,6 +46,38 @@ distributions:
 	if c.Server.DataDir != filepath.Join(root, "data") {
 		t.Fatalf("data dir: %q", c.Server.DataDir)
 	}
+	if c.Auth.UsersDir != "" {
+		t.Fatalf("usersDir: %q", c.Auth.UsersDir)
+	}
+	if c.Runtime.Moniforge != "" {
+		t.Fatalf("moniforge: %q", c.Runtime.Moniforge)
+	}
+}
+
+func TestLoadAuthAndMoniforge(t *testing.T) {
+	path := writeConfig(t, `
+server:
+  dataDir: data
+runtime:
+  dshBin: /bin/true
+  moniforge: mf
+auth:
+  usersDir: users
+distributions:
+  default:
+    path: dist
+`)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Dir(path)
+	if c.Auth.UsersDir != filepath.Join(root, "users") {
+		t.Fatalf("usersDir: %q", c.Auth.UsersDir)
+	}
+	if c.Runtime.Moniforge != filepath.Join(root, "mf") {
+		t.Fatalf("moniforge: %q", c.Runtime.Moniforge)
+	}
 }
 
 func TestLoadRejectsMissingDistribution(t *testing.T) {
@@ -191,168 +223,12 @@ func TestDataDirRejectsShellMetacharacters(t *testing.T) {
 	}
 }
 
-// sgeConfig is a minimal valid SGE section (paths lexical: Validate never stats
-// the shared filesystem, only `dw doctor` does).
-const validSGE = `
-  sge:
-    pe: smp
-    submitDir: /data/dw/sge/submit
-    rendezvousDir: /data/dw
-    apptainerImage: /data/dw/images/dw-runtime.sif
-`
-
-func loadSGE(t *testing.T, extra string) (*Config, error) {
-	t.Helper()
-	body := fmt.Sprintf(baseConfig, extra)
-	body = strings.Replace(body, "  dataDir: data", "  dataDir: /data/dw", 1)
-	return Load(writeConfig(t, body))
-}
-
-func TestSGEDefaults(t *testing.T) {
-	c, err := loadSGE(t, validSGE)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := c.Runtime.SGE
-	if s == nil {
-		t.Fatal("sge section missing")
-	}
-	if !s.IsEnabled() || !s.TunnelEnabled() || s.IdleReapEnabled() {
-		t.Fatalf("defaults: enabled=%v tunnel=%v idleReap=%v", s.IsEnabled(), s.TunnelEnabled(), s.IdleReapEnabled())
-	}
-	for name, got := range map[string]string{
-		"qsub": s.Qsub, "qstat": s.Qstat, "qdel": s.Qdel, "qalter": s.Qalter, "ssh": s.SSH,
-		"peAccounting": s.PEAccounting, "gpuResourceFlag": s.GPUFlag, "pollEvery": s.PollEvery,
-		"tunnelReadyTimeout": s.TunnelReadyTimeout, "warnBefore": s.WarnBefore,
-		"minHVmemPerSlot": s.MinHVmemPerSlot, "homeBox": s.HomeBox,
-		"workspaceBox": s.WorkspaceBox, "distBox": s.DistBox, "dwBox": s.DWBox, "dshBox": s.DSHBox,
-	} {
-		if got == "" {
-			t.Fatalf("%s default is missing", name)
-		}
-	}
-	if len(s.ContainerArgs) == 0 {
-		t.Fatal("containerArgs default is missing")
-	}
-}
-
-func TestSGERejectsContradictions(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
-		want string
-	}{
-		{
-			name: "renewFor without renewBefore",
-			body: validSGE + "    renewFor: 2h\n",
-			want: "renewBefore",
-		},
-		{
-			name: "warnBefore below renewBefore",
-			body: validSGE + "    renewBefore: 1h\n    warnBefore: 10m\n",
-			want: "warnBefore",
-		},
-		{
-			name: "tunnel and directDial",
-			body: validSGE + "    directDial: true\n",
-			want: "directDial",
-		},
-		{
-			name: "no tunnel and no directDial",
-			body: validSGE + "    tunnel: false\n",
-			want: "tunnel=false",
-		},
-		{
-			name: "control root outside the shared filesystem",
-			body: strings.Replace(validSGE, "rendezvousDir: /data/dw", "rendezvousDir: /scratch/rdv", 1),
-			want: "must contain",
-		},
-		{
-			name: "missing pe",
-			body: strings.Replace(validSGE, "    pe: smp\n", "", 1),
-			want: "pe is required",
-		},
-		{
-			name: "threads without threadsPerCore",
-			body: validSGE + "    peAccounting: threads\n",
-			want: "threadsPerCore",
-		},
-		{
-			name: "relative image",
-			body: strings.Replace(validSGE, "apptainerImage: /data/dw/images/dw-runtime.sif", "apptainerImage: images/dw.sif", 1),
-			want: "apptainerImage",
-		},
-		{
-			name: "bind of root",
-			body: validSGE + "    extraBinds:\n      - host: /\n        box: /data\n",
-			want: "extraBinds",
-		},
-		{
-			name: "pollEvery too small",
-			body: validSGE + "    pollEvery: 10ms\n",
-			want: "pollEvery",
-		},
-		{
-			name: "bad memory",
-			body: validSGE + "    minHVmemPerSlot: lots\n",
-			want: "minHVmemPerSlot",
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			_, err := loadSGE(t, c.body)
-			if err == nil {
-				t.Fatalf("expected an error mentioning %q", c.want)
-			}
-			if !strings.Contains(err.Error(), c.want) {
-				t.Fatalf("error must mention %q: %v", c.want, err)
-			}
-		})
-	}
-}
-
-// TestSGERelativePathResolvesAgainstTheConfigFile documents the one place a
-// relative SGE path is legitimate: submitDir next to the config file.
-func TestSGERelativePathResolvesAgainstTheConfigFile(t *testing.T) {
-	body := strings.Replace(validSGE, "submitDir: /data/dw/sge/submit", "submitDir: sge/submit", 1)
-	c, err := loadSGE(t, body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !filepath.IsAbs(c.Runtime.SGE.SubmitDir) || !strings.HasSuffix(c.Runtime.SGE.SubmitDir, "/sge/submit") {
-		t.Fatalf("submitDir: %q", c.Runtime.SGE.SubmitDir)
-	}
-}
-
-func TestSGEProblemsAggregate(t *testing.T) {
-	body := `
-  sge:
-    renewFor: 2h
-    directDial: true
-`
-	_, err := loadSGE(t, body)
-	if err == nil {
-		t.Fatal("expected errors")
-	}
-	msg := err.Error()
-	for _, want := range []string{"submitDir", "rendezvousDir", "pe is required", "apptainerImage", "renewBefore", "directDial"} {
-		if !strings.Contains(msg, want) {
-			t.Fatalf("aggregated error must mention %q: %s", want, msg)
-		}
-	}
-}
-
-func TestDefaultSGEWithoutSectionIsRejected(t *testing.T) {
-	body := strings.Replace(fmt.Sprintf(baseConfig, ""), "runtime:\n", "runtime:\n  default: sge\n", 1)
-	if _, err := Load(writeConfig(t, body)); err == nil {
-		t.Fatal("runtime.default: sge without a runtime.sge section must fail at load")
-	}
-}
-
 func TestUnknownDefaultBackendIsRejected(t *testing.T) {
-	body := strings.Replace(fmt.Sprintf(baseConfig, ""), "runtime:\n", "runtime:\n  default: k8s\n", 1)
-	if _, err := Load(writeConfig(t, body)); err == nil {
-		t.Fatal("an unknown backend must fail at load")
+	for _, name := range []string{"k8s", "sge", "pod"} {
+		body := strings.Replace(fmt.Sprintf(baseConfig, ""), "runtime:\n", "runtime:\n  default: "+name+"\n", 1)
+		if _, err := Load(writeConfig(t, body)); err == nil {
+			t.Fatalf("runtime.default %s must fail at load", name)
+		}
 	}
 }
 

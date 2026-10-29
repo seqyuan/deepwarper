@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seqyuan/deepwarper/internal/auth"
 	"github.com/seqyuan/deepwarper/internal/config"
 	"github.com/seqyuan/deepwarper/internal/instance"
 	"github.com/seqyuan/deepwarper/internal/model"
@@ -46,6 +47,7 @@ type sessionPayload struct {
 	User      string `json:"u"`
 	Authority string `json:"a"`
 	Exp       int64  `json:"e"`
+	Version   int    `json:"v"`
 }
 
 func New(cfg *config.Config, mgr *instance.Manager, logger *log.Logger) (*Gateway, error) {
@@ -117,6 +119,9 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("/api/local/status", g.handleStatus)
 	mux.HandleFunc("/api/local/stop", g.handleStop)
 	mux.HandleFunc("/_dw/launch", g.handleLaunchTicket)
+	mux.HandleFunc("/login", g.handleLogin)
+	mux.HandleFunc("/_dw/plugins", g.handlePlugins)
+	mux.HandleFunc("/_dw/mounts", g.handleMounts)
 	mux.HandleFunc("/", g.handleProxy)
 	return mux
 }
@@ -242,6 +247,13 @@ func (g *Gateway) handleLaunchTicket(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) signSession(user, authority string) (string, error) {
 	p := sessionPayload{User: user, Authority: authority, Exp: time.Now().Add(g.cfg.SessionTTL()).Unix()}
+	if g.loginEnabled() {
+		u, err := auth.Load(g.cfg.Auth.UsersDir, user)
+		if err != nil {
+			return "", err
+		}
+		p.Version = u.Auth.SessionVersion
+	}
 	data, err := json.Marshal(p)
 	if err != nil {
 		return "", err
@@ -274,6 +286,12 @@ func (g *Gateway) verifySession(value, authority string) (string, bool) {
 	}
 	if p.Exp < time.Now().Unix() || p.Authority != authority {
 		return "", false
+	}
+	if g.loginEnabled() {
+		u, err := auth.Load(g.cfg.Auth.UsersDir, p.User)
+		if err != nil || u.Auth.SessionVersion != p.Version {
+			return "", false
+		}
 	}
 	return p.User, true
 }
@@ -353,9 +371,17 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if inst == nil {
+		if g.loginEnabled() {
+			g.handleUserHome(w, r)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
+	g.serveResolved(w, r, inst)
+}
+
+func (g *Gateway) serveResolved(w http.ResponseWriter, r *http.Request, inst *model.Instance) {
 	auth := canonicalAuthority(r.Host)
 	cookie, err := r.Cookie("dw_session")
 	if err != nil {
@@ -371,17 +397,14 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if inst.State == model.StateQueued || inst.State == model.StateStarting {
-		// SGE returns a queued record immediately (launchWait: 0); the browser
-		// must see progress, not a 503. The meta refresh keeps the ticket URL
-		// out of the page and retries with the dw_session cookie.
+	if inst.State == model.StateStarting {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Retry-After", "3")
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`<!doctype html><html><head><meta charset="utf-8">` +
 			`<meta http-equiv="refresh" content="3">` +
 			`<title>DeepWarper 启动中</title></head><body style="font-family:system-ui">` +
-			`<h2>实例启动中</h2><p>正在等待调度器分配资源。本页每 3 秒自动刷新。</p>` +
+			`<h2>实例启动中</h2><p>正在等待本机进程就绪。本页每 3 秒自动刷新。</p>` +
 			`<p>状态：` + string(inst.State) + `</p></body></html>`))
 		return
 	}

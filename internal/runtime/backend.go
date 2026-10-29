@@ -2,13 +2,11 @@
 // that actually runs a `dw instance` process.
 //
 // The local backend implements this with either a systemd user unit or a
-// plain child process. A future SGE backend can implement the same interface
-// (plus optional prober/stopper extensions) without changing the manager.
+// plain child process. Each user gets their own process on this machine.
 package runtime
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -33,21 +31,6 @@ const (
 	PhaseFailed       Phase = "failed"
 	PhaseInactive     Phase = "inactive"
 	PhaseNotFound     Phase = "not-found"
-
-	// Scheduler-backed phases (SGE). They exist next to systemd's vocabulary
-	// because a job's lifecycle is genuinely different from a unit's: a job can
-	// wait in a queue for hours and can be paused by the scheduler without
-	// stopping.
-	//
-	// PhaseQueued is submitted but not placed yet.
-	PhaseQueued Phase = "queued"
-	// PhaseRunning means the scheduler reports the job holds a slot.
-	PhaseRunning Phase = "running"
-	// PhaseSuspended is SGE's s/S: preempted or held. The job is ALIVE — it
-	// holds its slot and may resume, so it must never be reaped or resubmitted.
-	PhaseSuspended Phase = "suspended"
-	// PhaseGone is a confirmed "the scheduler does not know this job".
-	PhaseGone Phase = "gone"
 )
 
 // Alive reports whether the backend still owns a process we must not orphan.
@@ -56,8 +39,7 @@ const (
 // would leak a live instance.
 func (p Phase) Alive() bool {
 	switch p {
-	case PhaseActive, PhaseActivating, PhaseReloading, PhaseDeactivating,
-		PhaseQueued, PhaseRunning, PhaseSuspended:
+	case PhaseActive, PhaseActivating, PhaseReloading, PhaseDeactivating:
 		return true
 	default:
 		return false
@@ -68,7 +50,7 @@ func (p Phase) Alive() bool {
 // hiccup must not orphan a healthy instance.
 func (p Phase) Gone() bool {
 	switch p {
-	case PhaseFailed, PhaseInactive, PhaseNotFound, PhaseGone:
+	case PhaseFailed, PhaseInactive, PhaseNotFound:
 		return true
 	default:
 		return false
@@ -93,11 +75,6 @@ type Observation struct {
 	// NegativeReadings counts consecutive "looks dead" probes. Unit mode
 	// only reports Gone after three of them.
 	NegativeReadings int `json:"negative_readings,omitempty"`
-	// QueuePos is the 1-based position among pending jobs (scheduler backends
-	// only). It is the user-visible answer to a long queue wait.
-	QueuePos int `json:"queue_pos,omitempty"`
-	// Node is the compute node the scheduler placed the job on, when known.
-	Node string `json:"node,omitempty"`
 	// Note is human text for the record or the UI. It must never carry a
 	// credential: it is copied into model.Instance.Error and status JSON.
 	Note string `json:"note,omitempty"`
@@ -161,63 +138,4 @@ type Backend interface {
 	Start(ctx context.Context, spec agent.Spec) (Handle, error)
 	Stop(ctx context.Context, inst *model.Instance) error
 	Probe(ctx context.Context, inst *model.Instance) (Observation, error)
-}
-
-// ErrNotYetRunning is returned when a unit is provably submitted but not placed
-// or not ready yet. It is not a failure: Ensure turns it into a `queued` record
-// and the fast tick promotes the instance when the scheduler gets to it.
-var ErrNotYetRunning = errors.New("unit is not running yet")
-
-// Adopter re-establishes reachability after a control-plane restart and returns
-// the loopback endpoint the gateway should dial. A backend that cannot adopt
-// simply does not implement it, and the manager falls back to ready.json.
-type Adopter interface {
-	Adopt(ctx context.Context, inst *model.Instance) (host string, port int, err error)
-}
-
-// Renewer extends a unit's own scheduler ceiling (SGE `h_rt`). A renewal
-// failure is a countdown, never a stop: it returns an error and leaves the
-// record untouched.
-type Renewer interface {
-	Renew(ctx context.Context, inst *model.Instance) (renewed bool, err error)
-}
-
-// LeaseWarner reports whether a unit is close enough to its scheduler ceiling
-// to deserve a warning. Deduplication is the manager's job.
-type LeaseWarner interface {
-	LeaseWarning(inst *model.Instance) (msg string, warn bool)
-}
-
-// EndpointDescriber lets a handle publish far-side details the record keeps for
-// operators: the compute node the job landed on and the loopback port it bound
-// there. The manager dials Port; Node/JobPort describe the other end.
-type EndpointDescriber interface {
-	DescribeEndpoint() (node string, jobPort int)
-}
-
-// LeaseHandle exposes the scheduler ceiling a freshly started unit inherited,
-// so the manager can persist it
-// (inst.LeaseExpiresAt) at launch instead of guessing later.
-type LeaseHandle interface {
-	LeaseExpiresAt(started time.Time) time.Time
-}
-
-// Policy carries a backend's lifecycle opinions. A backend without one keeps
-// the local defaults, so the local backend needs no changes.
-type Policy interface {
-	// LaunchBudget is how long Ensure blocks waiting for readiness before it
-	// returns a `queued` record. Zero means "probe once, never block".
-	LaunchBudget() time.Duration
-	// PollInterval is the fast tick while any instance is unsettled.
-	PollInterval() time.Duration
-	// IdleReapAllowed is false on SGE by default: the lifecycle ceiling there
-	// is h_rt, and re-queueing a preempted job is user-hostile.
-	IdleReapAllowed() bool
-}
-
-// PortAllocator hands out loopback ports. ports.Pool implements it; the SGE
-// backend uses it for the login-node end of its ssh tunnel.
-type PortAllocator interface {
-	Acquire(owner string) (int, error)
-	Release(port int)
 }

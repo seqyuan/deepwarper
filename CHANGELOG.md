@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.0 — 2026-10-30
+
+- 管理员用 `dw user` 建账号，浏览器登录后进入该用户自己的 dsh
+- 每个实例用 bubblewrap 拼目录视图；本地目录和 TOS/S3 bucket 前缀挂进去
+- 共享 moniforge 只读，用户在 `/workspace/envs` 里用 `dw-env` 装软件
+- 用户可从本机 catalog 启用额外 dsh 插件
+- 去掉 SGE 任务和 k8s Pod 运行时
+
 ## v0.1.0 — 2026-10-27
 
 - 初始版本：DeepWarper 单机 local 模式与子域名网关

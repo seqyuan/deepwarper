@@ -95,6 +95,12 @@ func (b *Backend) Start(ctx context.Context, spec agent.Spec) (runtime.Handle, e
 		return nil, errors.New("local backend: dw binary is required")
 	}
 	b.applyDefaults()
+	// bwrap wraps dsh inside the agent so this process can still see the
+	// control directory. Fail here when the spec asks for it and it is
+	// not installed, before a unit or child is created.
+	if err := b.ensureBwrap(spec); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(spec.ControlDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -120,6 +126,20 @@ func (b *Backend) Start(ctx context.Context, spec agent.Spec) (runtime.Handle, e
 		return b.startUnit(ctx, spec)
 	}
 	return b.startChild(ctx, spec, limiter)
+}
+
+func (b *Backend) ensureBwrap(spec agent.Spec) error {
+	if len(spec.BwrapArgv) == 0 {
+		return nil
+	}
+	name := strings.TrimSpace(spec.BwrapArgv[0])
+	if name == "" {
+		name = "bwrap"
+	}
+	if _, err := b.runner().LookPath(name); err != nil {
+		return fmt.Errorf("bwrap requested but not found: %w", err)
+	}
+	return nil
 }
 
 func (b *Backend) resolve(ctx context.Context) (string, error) {

@@ -1,7 +1,6 @@
 # 本机 POC 验证记录
 
-> 目标：在进入 SGE/k8s 之前，先在本机验证最难改的四件事：
-> 子域名路由、平台 ticket、dsh launch-token broker、单机多用户实例与持久化。
+> 目标：在本机验证子域名路由、平台 ticket、dsh launch-token broker、单机多用户实例与持久化。
 
 ## 1. 环境
 
@@ -155,15 +154,14 @@ session 文件示例：
 
 3. **单机模式不是强隔离。**
    - POC 所有 dsh 进程是同一个 OS 用户。
-   - 生产单机模式需要 systemd cgroup + 精确 bind；不可信多租户应使用容器/per-user UID 或 SGE/k8s。
+   - 生产上用 systemd cgroup 和每个实例自己的目录视图。进程仍是同一个 OS 用户，这不是互不信任租户的边界。
 
 ## 6. POC 的边界
 
 未验证/未实现：
 
 - 自定义 distribution profile（POC 用 dsh 自带 `web` profile）；
-- SGE / k8s backend；
-- TOS/S3 FUSE；
+- TOS/S3 目录挂载；
 - systemd/prlimit 资源限制；
 - 真实平台 SSO / 平台后端调用；
 - 浏览器 Playwright 全链路（当前用 curl + Node WebSocket）。

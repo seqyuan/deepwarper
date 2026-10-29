@@ -1,39 +1,57 @@
 # deepwarper
 
-把定制好的 DeepSeek Harness Web 做成可分发的运行时：一次构建插件集，按需为每个用户/项目启动带工作区、数据挂载和资源上限的实例。
+把定制好的 DeepSeek Harness Web 做成可分发的运行时。一个 Go 二进制管账号、登录和每个用户自己的 dsh 进程。
 
-- 方案规划：[`docs/plan.md`](docs/plan.md)
-- 配置草案：[`examples/config.sge.yaml`](examples/config.sge.yaml)、[`examples/storages.yaml`](examples/storages.yaml)、[`examples/distribution.yaml`](examples/distribution.yaml)
-- 目标形态：Go 单二进制（控制面 + 网关 + 生命周期）+ 固定版本运行时镜像
-- 首发生产后端：SGE（控制面在登录节点，`ssh -L` 到计算节点）；local 用于开发；k8s 待集群能力确认
-- 入口：每个用户一个子域名（`https://<user>.dsh.example.com/`），平台按钮通过一次性 ticket 进入
-- 挂载：宿主路径 / PVC / TOS、S3 bucket（优先 FUSE，也支持预挂载/CSI）
-- 用户数据：`DSH_HOME` 按用户持久化，停止/重启保留会话、配置和用户自己的 API key
-- 单机模式：每个用户一个 dsh 进程 + 独立 home/workspace；systemd-run --user cgroup（prlimit fallback）
-- POC 记录：[`docs/poc-local.md`](docs/poc-local.md)
-- 单机生产模式验证：[`docs/local-mode.md`](docs/local-mode.md)
-- 综合审核与落地计划：[`plans/final-implementation-plan.md`](plans/final-implementation-plan.md)
-- 第二轮规划：[`plans/round2/final-plan.md`](plans/round2/final-plan.md)
-- SGE 模式说明：[`docs/sge-mode.md`](docs/sge-mode.md)
-- 当前状态：**local（含 systemd cgroup）+ SGE 后端已落地（SGE 为 fake-runner 验证，真实集群待配置）；FUSE/k8s 未实现**
+- 运行时：本机一个用户一个 dsh 进程。systemd-run --user 做 cgroup，没有 user systemd 时降级为 prlimit 或普通进程。
+- 入口：`dw user` 建账号，`dw serve` 提供登录页，登录后反代到该用户的 dsh。
+- 挂载：bubblewrap 拼出每个实例的目录视图。本地目录 bind 进去，火山 TOS 和其他 S3 兼容 bucket 由宿主机 rclone 挂成目录后再 bind。
+- 环境：共享 moniforge/conda 前缀只读。用户用 `dw-env` 在 `/workspace/envs` 里装软件。
+- 插件：站点 distribution 是底座，用户从本机 catalog 启用额外插件。
+- 配置：[`examples/config.local.yaml`](examples/config.local.yaml)、[`examples/storages.yaml`](examples/storages.yaml)、[`examples/distribution.yaml`](examples/distribution.yaml)
+- 说明：[`docs/local-mode.md`](docs/local-mode.md)、[`docs/plan.md`](docs/plan.md)
 
-## 快速理解
+## 快速开始
 
-```text
-平台按钮 → dw serve → 每用户一个 dsh web 实例（子域名）
-                    ├─ /workspace        rw
-                    ├─ /data/ref         ro
-                    └─ /data/raw         ro (TOS/S3 bucket)
-```
-
-一次构建：
+一个 `dw` 二进制。管理员用 CLI 建用户，`dw serve` 给出登录页，登录后反代到该用户自己的 dsh。共享的 moniforge/conda 前缀只读挂载，用户环境在 `/workspace` 下，用 `dw-env` 创建。本地目录和 bucket 前缀按用户挂载。额外 dsh 插件从本地 catalog 启用。
 
 ```bash
-dw dist build -f distribution.yaml
-```
+# 配置目录默认是可执行文件旁的 config/。dw user 和 dw passwd 会提示输入密码，终端上不回显。
+# 非交互场景才设置 DW_PASSWORD。
+dw user -d /etc/dw alice
+dw remote add -d /etc/dw tos1 --provider tos --endpoint https://tos.example --region cn-beijing --bucket data --credential-file /etc/dw/cred
+dw mount add -d /etc/dw alice --remote tos1 --prefix proj/raw --at /workspace/raw --ro
+dw mount add -d /etc/dw alice --local /srv/ref:/data/ref:ro
+dw catalog add -d /etc/dw office /opt/dw/catalog/office
+dw plugin enable -d /etc/dw alice office
 
-一次部署：
-
-```bash
 dw serve -c config.yaml
+# 浏览器打开 /login，进入该用户自己的 dsh。
+# 实例未运行时页面会说明需由管理员启动，不会自动拉起 dsh。
 ```
+
+`config.yaml` 里加上（留空则保持原来的 ticket 入口，不挂 conda）：
+
+```yaml
+auth:
+  usersDir: /etc/dw/users
+runtime:
+  moniforge: /opt/moniforge
+```
+
+本地路径挂载还要一份 `config/roots.yaml`，host 必须落在其中恰好一个 root 下：
+
+```yaml
+roots:
+  - id: ref
+    host: /srv
+    allowRw: false
+```
+
+登录进实例后，环境不使用 base：
+
+```bash
+dw-env create analysis numpy pandas
+dw-env run analysis -- python
+```
+
+`dw-env` 写在数据目录的 `bin/dw-env`。`dw doctor` 会打印 moniforge、bwrap、rclone 和 users 目录；缺可选工具只是警告。

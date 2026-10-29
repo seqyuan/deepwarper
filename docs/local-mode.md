@@ -193,5 +193,5 @@ $ DW_TEST_SYSTEMD=1 DW_TEST_SYSTEMD_DW=$PWD/dw go test ./internal/runtime/local 
 
 - systemd 模式需要可用的 user manager（`systemd-run --user`）和 cgroup v2；`MemorySwapMax` 在纯 cgroup v1 上会失败。
 - 回退路径没有 RSS 级内存上限，也没有 fork 炸弹防护（`RLIMIT_NPROC` 不可用），记录里的 `limiter` 字段会如实标注。
-- 只有 local backend；SGE/FUSE/`dw dist build` 不在本轮范围（见 `plans/round2/final-plan.md` §3）。
+- 运行时只有本机进程：每个用户一个 dsh，由 systemd user unit 或普通子进程拉起。
 - 平台鉴权为 Bearer token；HMAC/ticket 持久化接口已留。

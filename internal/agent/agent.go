@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/seqyuan/deepwarper/internal/mount"
 	"github.com/seqyuan/deepwarper/internal/rendezvous"
 	"github.com/seqyuan/deepwarper/internal/state"
 )
@@ -25,9 +26,8 @@ import (
 type Spec struct {
 	InstanceID  string `json:"instance_id"`
 	Incarnation string `json:"incarnation"`
-	// UnitName is the systemd unit the control plane assigned, when the
-	// local backend runs in unit mode. Informational on the agent side; the SGE
-	// backend uses it as the job name.
+	// UnitName is the systemd unit the control plane assigned when the
+	// local backend runs in unit mode. Informational on the agent side.
 	UnitName    string `json:"unit_name,omitempty"`
 	Profile     string `json:"profile"`
 	DshBin      string `json:"dsh_bin"`
@@ -39,15 +39,8 @@ type Spec struct {
 	LogPath     string `json:"log_path"`
 	PublicURL   string `json:"public_url"`
 	TrustedHost string `json:"trusted_host"`
-	// Port is the loopback port dsh binds. Zero means "pick a free loopback
-	// port on this host", which is what the SGE backend sends because the port
-	// is only knowable on the compute node.
-	Port int `json:"port"`
-	// LoginPort is the login-node port the control plane reserved for the
-	// tunnel. It is informational inside the job and must never be bound there:
-	// binding it on a compute node would collide with the tunnel on the login
-	// node. A test asserts boxSpec.Port == 0 && boxSpec.LoginPort != 0.
-	LoginPort    int    `json:"login_port,omitempty"`
+	// Port is the loopback port dsh binds. Zero means pick a free loopback port.
+	Port         int    `json:"port"`
 	PatchPath    string `json:"patch_path,omitempty"`
 	PatchContent string `json:"patch_content,omitempty"`
 	Heartbeat    string `json:"heartbeat,omitempty"`
@@ -57,6 +50,22 @@ type Spec struct {
 	Memory       string `json:"memory,omitempty"`
 	Walltime     string `json:"walltime,omitempty"`
 	GPU          int    `json:"gpu,omitempty"`
+	// BwrapArgv, when non-empty, is the sandbox prefix. The agent runs dsh
+	// as the command inside it. Rclone mounts are started on the host first
+	// so the fuse directories exist for those binds.
+	BwrapArgv []string     `json:"bwrap_argv,omitempty"`
+	Rclone    []RcloneSpec `json:"rclone,omitempty"`
+	Env       []string     `json:"env,omitempty"`
+	// Wrapper is the in-sandbox script. It is stored on the spec because
+	// rendezvous.Clear deletes control-dir files before the agent runs.
+	Wrapper string `json:"wrapper,omitempty"`
+}
+
+// RcloneSpec is one host-side rclone mount stored in spec.json.
+type RcloneSpec struct {
+	Name       string   `json:"name"`
+	Argv       []string `json:"argv"`
+	MountPoint string   `json:"mount_point"`
 }
 
 const (
@@ -84,9 +93,8 @@ func Run(ctx context.Context, specPath string) int {
 		fmt.Fprintln(os.Stderr, "spec is missing control_dir/home/workspace")
 		return ExitControlDir
 	}
-	// On a cluster the control plane cannot know which port is free on the node
-	// that will run the job, so it sends 0 and the port is chosen here. The
-	// chosen port is published in ready.json; the login node never guesses it.
+	// Port 0 means this process picks a free loopback port and publishes it
+	// in ready.json.
 	if spec.Port == 0 {
 		port, err := freeLoopbackPort()
 		if err != nil {
@@ -150,25 +158,41 @@ func Run(ctx context.Context, specPath string) int {
 		return ExitDshMissing
 	}
 
-	args := []string{"--profile", spec.Profile}
-	if spec.PatchPath != "" {
-		// --patch is a launcher option; it must precede app args.
-		args = append(args, "--patch", spec.PatchPath)
+	argv, err := prefixCommand(spec, exec.LookPath)
+	if err != nil {
+		fmt.Fprintf(logger, "%v\n", err)
+		pub("state", "failed")
+		return 1
 	}
-	args = append(args,
-		"--no-open",
-		"--host", "127.0.0.1",
-		"--port", fmt.Sprint(spec.Port),
-		"--public-url", spec.PublicURL,
-		"--trusted-host", spec.TrustedHost,
-	)
-	cmd := exec.Command(spec.DshBin, args...)
+	// Clear already removed anything attachSandbox wrote. Rewrite the wrapper
+	// from the spec immediately before bwrap starts.
+	if err := writeWrapper(spec); err != nil {
+		fmt.Fprintf(logger, "%v\n", err)
+		pub("state", "failed")
+		return 1
+	}
+	var fuseMounts []string
+	if len(spec.Rclone) > 0 {
+		var err error
+		fuseMounts, err = startHostRclone(spec)
+		if err != nil {
+			fmt.Fprintf(logger, "%v\n", err)
+			pub("state", "failed")
+			return 1
+		}
+		defer stopHostRclone(fuseMounts)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = append(os.Environ(),
-		"DSH_HOME="+spec.Home,
-		"HOME="+spec.Home,
-		"DSH_PERMISSION_MODE=workspace-write",
-	)
+	if len(spec.BwrapArgv) > 0 {
+		cmd.Env = sandboxEnv(os.Environ(), spec.Env)
+	} else {
+		cmd.Env = append(os.Environ(),
+			"DSH_HOME="+spec.Home,
+			"HOME="+spec.Home,
+			"DSH_PERMISSION_MODE=workspace-write",
+		)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -308,6 +332,201 @@ func Run(ctx context.Context, specPath string) int {
 	}
 }
 
+// sandboxEnv is the only environment a bwrap child receives. Host secrets
+// such as DW_PASSWORD are not forwarded.
+func sandboxEnv(host, planned []string) []string {
+	keep := map[string]string{}
+	take := func(kv string, limit bool) {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			return
+		}
+		if limit && k != "LANG" && k != "LC_ALL" {
+			return
+		}
+		switch k {
+		case "PATH", "HOME", "DSH_HOME", "LANG", "LC_ALL":
+			keep[k] = v
+		}
+	}
+	for _, kv := range host {
+		take(kv, true)
+	}
+	for _, kv := range planned {
+		take(kv, false)
+	}
+	var out []string
+	for _, k := range []string{"PATH", "HOME", "DSH_HOME", "LANG", "LC_ALL"} {
+		if v, ok := keep[k]; ok {
+			out = append(out, k+"="+v)
+		}
+	}
+	return out
+}
+
+func resolveRcloneArgv(argv []string, look func(string) (string, error)) ([]string, error) {
+	if len(argv) == 0 {
+		return nil, errors.New("rclone argv is empty")
+	}
+	out := append([]string{}, argv...)
+	if filepath.IsAbs(out[0]) {
+		return out, nil
+	}
+	p, err := look(out[0])
+	if err != nil {
+		return nil, fmt.Errorf("rclone requested but not found: %w", err)
+	}
+	out[0] = p
+	return out, nil
+}
+
+func readMountinfo() (string, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func startHostRclone(spec Spec) ([]string, error) {
+	var points []string
+	var cmds []*exec.Cmd
+	fail := func(err error) ([]string, error) {
+		stopHostRclone(points)
+		for _, cmd := range cmds {
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				_ = cmd.Wait()
+			}
+		}
+		return nil, err
+	}
+	for _, rc := range spec.Rclone {
+		if err := os.MkdirAll(rc.MountPoint, 0o700); err != nil {
+			return fail(err)
+		}
+		argv, err := resolveRcloneArgv(rc.Argv, exec.LookPath)
+		if err != nil {
+			return fail(err)
+		}
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := cmd.Start(); err != nil {
+			return fail(fmt.Errorf("rclone mount %s: %w", rc.Name, err))
+		}
+		cmds = append(cmds, cmd)
+		if err := mount.WaitFuse(rc.MountPoint, mount.RcloneReadyTimeout, readMountinfo, time.Sleep); err != nil {
+			return fail(err)
+		}
+		points = append(points, rc.MountPoint)
+	}
+	return points, nil
+}
+
+func stopHostRclone(points []string) {
+	for _, p := range points {
+		_ = exec.Command("fusermount", "-u", p).Run()
+		_ = exec.Command("umount", p).Run()
+	}
+}
+
+func writeWrapper(spec Spec) error {
+	if spec.Wrapper == "" {
+		return nil
+	}
+	if spec.ControlDir == "" {
+		return errors.New("wrapper requires a control directory")
+	}
+	if err := os.MkdirAll(spec.ControlDir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(spec.ControlDir, "dw-wrap.sh")
+	if err := os.WriteFile(path, []byte(spec.Wrapper), 0o755); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o755)
+}
+
+// dshArgv is the process the agent would exec when bwrap is not in use.
+func dshArgv(spec Spec) []string {
+	args := []string{spec.DshBin, "--profile", spec.Profile}
+	patch := spec.PatchPath
+	if len(spec.BwrapArgv) > 0 && patch != "" {
+		// The control directory is bind-mounted at /dw/control.
+		patch = "/dw/control/" + filepath.Base(patch)
+	}
+	if patch != "" {
+		// --patch is a launcher option; it must precede app args.
+		args = append(args, "--patch", patch)
+	}
+	args = append(args,
+		"--no-open",
+		"--host", "127.0.0.1",
+		"--port", fmt.Sprint(spec.Port),
+		"--public-url", spec.PublicURL,
+		"--trusted-host", spec.TrustedHost,
+	)
+	return args
+}
+
+// prefixCommand returns the dsh argv, or that argv inside bwrap when the
+// spec carries a sandbox prefix. lookPath is called only when bwrap is
+// requested. A missing bwrap is an error.
+func prefixCommand(spec Spec, lookPath func(string) (string, error)) ([]string, error) {
+	cmd := dshArgv(spec)
+	if len(spec.BwrapArgv) == 0 {
+		return cmd, nil
+	}
+	name := strings.TrimSpace(spec.BwrapArgv[0])
+	if name == "" {
+		name = "bwrap"
+	}
+	resolved, err := lookPath(name)
+	if err != nil {
+		return nil, fmt.Errorf("bwrap requested but not found: %w", err)
+	}
+	prefix := append([]string{}, spec.BwrapArgv...)
+	prefix[0] = resolved
+	cut := len(prefix)
+	for i, a := range prefix {
+		if a == "--" {
+			cut = i
+			break
+		}
+	}
+	var planned []string
+	if cut < len(prefix) {
+		planned = prefix[cut+1:]
+	}
+	prefix = append(prefix[:cut], "--")
+	// A bucket sandbox's inner command is the wrapper. Keep it and let it
+	// execute dsh. Any other planned tail is replaced by the live dsh argv.
+	if len(planned) > 0 && (planned[0] == "/bin/sh" || planned[0] == "sh") {
+		prefix = append(prefix, planned...)
+	}
+	return append(prefix, cmd...), nil
+}
+
+func setEnv(env []string, key, val string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			if !replaced {
+				out = append(out, prefix+val)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, kv)
+	}
+	if !replaced {
+		out = append(out, prefix+val)
+	}
+	return out
+}
+
 func killGroup(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
@@ -318,9 +537,8 @@ func killGroup(cmd *exec.Cmd) {
 }
 
 // freeLoopbackPort bind-probes 127.0.0.1:0 and hands the port back. The window
-// between closing the listener and dsh binding it is one EADDRINUSE away from a
-// loud, log-bearing failure, which is the right trade on a compute node: the
-// alternative is a fixed port that collides with the previous job on the node.
+// between closing the listener and dsh binding it can lose the port to another
+// process; that failure is logged instead of guessing a fixed port.
 func freeLoopbackPort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
