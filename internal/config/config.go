@@ -2,13 +2,17 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/seqyuan/deepwarper/internal/model"
 )
 
 type Config struct {
@@ -25,12 +29,20 @@ type Config struct {
 // directory keeps the historical ticket-only gateway.
 type AuthConfig struct {
 	UsersDir string `yaml:"usersDir"`
+	// LoginMaxAttempts, LoginWindow and LoginLockout bound the per-IP login
+	// rate limiter. Zero or empty values fall back to the defaults.
+	LoginMaxAttempts int    `yaml:"loginMaxAttempts"`
+	LoginWindow      string `yaml:"loginWindow"`
+	LoginLockout     string `yaml:"loginLockout"`
 }
 
 type ServerConfig struct {
 	Listen   string `yaml:"listen"`
 	DataDir  string `yaml:"dataDir"`
 	LogLevel string `yaml:"logLevel"`
+	// WorkspaceRoots are extra directories a caller may request as a
+	// workspace. Relative entries are resolved next to the config file.
+	WorkspaceRoots []string `yaml:"workspaceRoots"`
 }
 
 type RoutingConfig struct {
@@ -38,6 +50,11 @@ type RoutingConfig struct {
 	HostSuffix   string `yaml:"hostSuffix"`
 	PublicScheme string `yaml:"publicScheme"`
 	PathBase     string `yaml:"pathBase"`
+	// PublicPort is the externally visible port. 0 derives it from listen.
+	PublicPort int `yaml:"publicPort"`
+	// TrustProxyHeaders accepts X-Forwarded-Host/-Proto from the fronting
+	// proxy when set.
+	TrustProxyHeaders bool `yaml:"trustProxyHeaders"`
 }
 
 type PlatformConfig struct {
@@ -229,9 +246,21 @@ func (c *Config) applyDefaults(path string) {
 	if c.Quotas.MaxInstancesPerUser == 0 {
 		c.Quotas.MaxInstancesPerUser = 1
 	}
+	if c.Auth.LoginMaxAttempts == 0 {
+		c.Auth.LoginMaxAttempts = defaultLoginMaxAttempts
+	}
+	if c.Auth.LoginWindow == "" {
+		c.Auth.LoginWindow = "5m"
+	}
+	if c.Auth.LoginLockout == "" {
+		c.Auth.LoginLockout = "5m"
+	}
 	abs, err := filepath.Abs(path)
 	if err == nil {
 		c.Server.DataDir = absJoin(filepath.Dir(abs), c.Server.DataDir)
+		for i, root := range c.Server.WorkspaceRoots {
+			c.Server.WorkspaceRoots[i] = absJoin(filepath.Dir(abs), root)
+		}
 		if c.Platform.TokenFile != "" {
 			c.Platform.TokenFile = absJoin(filepath.Dir(abs), c.Platform.TokenFile)
 		}
@@ -272,26 +301,59 @@ func (c *Config) Validate() error {
 	if c.Routing.Mode == "host" && c.Routing.HostSuffix == "" {
 		bad("routing.hostSuffix is required in host mode")
 	}
+	if c.Routing.HostSuffix != "" {
+		if err := validateHostSuffix(c.Routing.HostSuffix); err != nil {
+			bad("routing.hostSuffix: %v", err)
+		}
+	}
+	switch c.Routing.PublicScheme {
+	case "http", "https":
+	default:
+		bad("routing.publicScheme must be http or https")
+	}
+	if c.Routing.PublicPort < 0 || c.Routing.PublicPort > 65535 {
+		bad("routing.publicPort must be between 0 and 65535")
+	}
 	if c.Server.Listen == "" {
 		bad("server.listen is required")
+	} else if err := validateListen(c.Server.Listen); err != nil {
+		bad("server.listen: %v", err)
 	}
-	if c.Runtime.Local.PortRange[0] <= 0 || c.Runtime.Local.PortRange[1] < c.Runtime.Local.PortRange[0] {
-		bad("runtime.local.portRange is invalid")
+	lo, hi := c.Runtime.Local.PortRange[0], c.Runtime.Local.PortRange[1]
+	if lo < 1024 || hi > 65535 || hi < lo {
+		bad("runtime.local.portRange must be within 1024-65535 with high >= low")
+	} else if hi-lo+1 < 16 {
+		bad("runtime.local.portRange must contain at least 16 ports")
 	}
 	if c.Runtime.DSHBin == "" {
 		bad("runtime.dshBin is required")
 	}
-	if _, err := time.ParseDuration(c.Platform.TicketTTL); err != nil {
-		bad("platform.ticketTTL: %v", err)
+	positiveDuration := func(label, raw string, min, max time.Duration) {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			bad("%s: %v", label, err)
+			return
+		}
+		if d <= 0 {
+			bad("%s must be a positive duration", label)
+			return
+		}
+		if min > 0 && d < min {
+			bad("%s must be at least %s", label, min)
+		}
+		if max > 0 && d > max {
+			bad("%s must be at most %s", label, max)
+		}
 	}
-	if _, err := time.ParseDuration(c.Platform.SessionTTL); err != nil {
-		bad("platform.sessionTTL: %v", err)
-	}
-	if _, err := time.ParseDuration(c.Runtime.ReadyTimeout); err != nil {
-		bad("runtime.readyTimeout: %v", err)
-	}
-	if _, err := time.ParseDuration(c.Runtime.ScanInterval); err != nil {
-		bad("runtime.scanInterval: %v", err)
+	positiveDuration("platform.ticketTTL", c.Platform.TicketTTL, 0, 24*time.Hour)
+	positiveDuration("platform.sessionTTL", c.Platform.SessionTTL, 0, 30*24*time.Hour)
+	positiveDuration("runtime.readyTimeout", c.Runtime.ReadyTimeout, 0, 0)
+	positiveDuration("runtime.scanInterval", c.Runtime.ScanInterval, time.Second, 10*time.Minute)
+	positiveDuration("runtime.heartbeat", c.Runtime.Heartbeat, time.Second, 0)
+	positiveDuration("auth.loginWindow", c.Auth.LoginWindow, 0, 0)
+	positiveDuration("auth.loginLockout", c.Auth.LoginLockout, 0, 0)
+	if c.Auth.LoginMaxAttempts < 0 {
+		bad("auth.loginMaxAttempts must be >= 0")
 	}
 	if err := c.validateLocal(); err != nil {
 		problems = append(problems, err.Error())
@@ -303,7 +365,31 @@ func (c *Config) Validate() error {
 	if err := validateUnitPath("server.dataDir", c.Server.DataDir); err != nil {
 		bad("%v", err)
 	}
+	for _, root := range c.Server.WorkspaceRoots {
+		if strings.TrimSpace(root) == "" {
+			bad("server.workspaceRoots contains an empty path")
+			continue
+		}
+		if !filepath.IsAbs(root) {
+			bad("server.workspaceRoots %q must be absolute", root)
+		}
+		if strings.ContainsAny(root, "\x00\r\n") {
+			bad("server.workspaceRoots %q contains a control character", root)
+			continue
+		}
+		fi, err := os.Stat(root)
+		if err != nil {
+			bad("server.workspaceRoots %q: %v", root, err)
+			continue
+		}
+		if !fi.IsDir() {
+			bad("server.workspaceRoots %q is not a directory", root)
+		}
+	}
 	for name, d := range c.Distributions {
+		if err := model.ValidateDistKey(name); err != nil {
+			bad("distribution %q: %v", name, err)
+		}
 		if d.Name == "" {
 			d.Name = name
 		}
@@ -316,7 +402,10 @@ func (c *Config) Validate() error {
 		if _, err := os.Stat(d.Path); err != nil {
 			bad("distribution %q: %v", name, err)
 		}
-		if strings.ContainsAny(d.ProfileName, "/\\") || d.ProfileName == "." || d.ProfileName == ".." {
+		if !model.IsSafeFileComponent(d.Name) {
+			bad("distribution %q: invalid name", name)
+		}
+		if !model.IsSafeFileComponent(d.ProfileName) {
 			bad("distribution %q: invalid profileName", name)
 		}
 		c.Distributions[name] = d
@@ -327,39 +416,121 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func (c *Config) TicketTTL() time.Duration {
-	d, _ := time.ParseDuration(c.Platform.TicketTTL)
+var (
+	hostLabelRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+)
+
+func validateListen(listen string) error {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return err
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	if strings.ContainsAny(host, " \t\r\n\x00") {
+		return fmt.Errorf("host %q contains whitespace or a control character", host)
+	}
+	return nil
+}
+
+func validateHostSuffix(suffix string) error {
+	if len(suffix) > 253 {
+		return fmt.Errorf("name is longer than 253 bytes")
+	}
+	if strings.ContainsAny(suffix, "/\\:@ \t\r\n\x00") {
+		return fmt.Errorf("%q must be a bare DNS name", suffix)
+	}
+	if strings.HasPrefix(suffix, ".") || strings.HasSuffix(suffix, ".") {
+		return fmt.Errorf("%q must not start or end with a dot", suffix)
+	}
+	for _, label := range strings.Split(suffix, ".") {
+		if len(label) == 0 || len(label) > 63 || !hostLabelRE.MatchString(label) {
+			return fmt.Errorf("%q is not a valid DNS name", suffix)
+		}
+	}
+	return nil
+}
+
+const (
+	defaultTicketTTL           = 60 * time.Second
+	defaultSessionTTL          = 12 * time.Hour
+	defaultSystemdStartTimeout = 10 * time.Second
+	defaultStopGrace           = 20 * time.Second
+	defaultReadyTimeout        = 90 * time.Second
+	defaultScanInterval        = 30 * time.Second
+	defaultHeartbeat           = 30 * time.Second
+	defaultLoginMaxAttempts    = 10
+	defaultLoginWindow         = 5 * time.Minute
+	defaultLoginLockout        = 5 * time.Minute
+)
+
+// positiveDurationOr returns def when raw is missing, unparsable or
+// non-positive so a zero-value Config never trips a ticker or timer.
+func positiveDurationOr(raw string, def time.Duration) time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil || d <= 0 {
+		return def
+	}
 	return d
+}
+
+func (c *Config) TicketTTL() time.Duration {
+	return positiveDurationOr(c.Platform.TicketTTL, defaultTicketTTL)
 }
 
 func (c *Config) SessionTTL() time.Duration {
-	d, _ := time.ParseDuration(c.Platform.SessionTTL)
-	return d
+	return positiveDurationOr(c.Platform.SessionTTL, defaultSessionTTL)
 }
 
 func (c *Config) SystemdStartTimeout() time.Duration {
-	d, _ := time.ParseDuration(c.Runtime.Local.SystemdStartTimeout)
-	return d
+	return positiveDurationOr(c.Runtime.Local.SystemdStartTimeout, defaultSystemdStartTimeout)
 }
 
 func (c *Config) StopGrace() time.Duration {
-	d, _ := time.ParseDuration(c.Runtime.Local.StopGrace)
-	return d
+	return positiveDurationOr(c.Runtime.Local.StopGrace, defaultStopGrace)
 }
 
 func (c *Config) ReadyTimeout() time.Duration {
-	d, _ := time.ParseDuration(c.Runtime.ReadyTimeout)
-	return d
+	return positiveDurationOr(c.Runtime.ReadyTimeout, defaultReadyTimeout)
 }
 
 func (c *Config) ScanInterval() time.Duration {
-	d, _ := time.ParseDuration(c.Runtime.ScanInterval)
-	return d
+	return positiveDurationOr(c.Runtime.ScanInterval, defaultScanInterval)
 }
 
 func (c *Config) Heartbeat() time.Duration {
-	d, _ := time.ParseDuration(c.Runtime.Heartbeat)
-	return d
+	return positiveDurationOr(c.Runtime.Heartbeat, defaultHeartbeat)
+}
+
+// EffectivePublicPort is the port users see: routing.publicPort when set,
+// otherwise the server.listen port.
+func (c *Config) EffectivePublicPort() int {
+	if c.Routing.PublicPort > 0 {
+		return c.Routing.PublicPort
+	}
+	_, port, err := net.SplitHostPort(c.Server.Listen)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// LoginLimit returns the effective login rate-limit settings. Missing or
+// invalid values fall back to the documented defaults.
+func (c *Config) LoginLimit() (int, time.Duration, time.Duration) {
+	max := c.Auth.LoginMaxAttempts
+	if max <= 0 {
+		max = defaultLoginMaxAttempts
+	}
+	window := positiveDurationOr(c.Auth.LoginWindow, defaultLoginWindow)
+	lockout := positiveDurationOr(c.Auth.LoginLockout, defaultLoginLockout)
+	return max, window, lockout
 }
 
 // validateLocal enforces the limiter/systemdUser matrix and duration bounds.

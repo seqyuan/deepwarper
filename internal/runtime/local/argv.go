@@ -47,15 +47,17 @@ func validateUnitName(name string) error {
 	return nil
 }
 
-// validateUnitPropertyPath rejects characters that would make the
+// ValidateUnitPath rejects characters that would make the
 // StandardOutput=/WorkingDirectory= property or the ExecStopPost= shell
-// snippet ambiguous. All other bytes are passed through unchanged.
-func validateUnitPropertyPath(label, p string) error {
+// snippet ambiguous, or that no exec argv can carry. All other bytes are
+// passed through unchanged. The manager also calls it for limiter=prlimit and
+// limiter=none so a path is rejected before any directory is created.
+func ValidateUnitPath(label, p string) error {
 	if p == "" {
 		return fmt.Errorf("%s is empty", label)
 	}
-	if strings.ContainsAny(p, "'\"\n\r%") {
-		return fmt.Errorf("%s %q contains one of ' \" \\n \\r %% which cannot be used in a systemd unit property", label, p)
+	if strings.ContainsAny(p, "'\"\n\r%\x00") {
+		return fmt.Errorf("%s %q contains one of ' \" newline carriage-return %% NUL which cannot be used in a systemd unit property", label, p)
 	}
 	return nil
 }
@@ -85,10 +87,10 @@ func unitArgv(o UnitArgvOptions) ([]string, error) {
 	if o.SpecPath == "" {
 		return nil, fmt.Errorf("spec path is required")
 	}
-	if err := validateUnitPropertyPath("working directory", o.WorkingDirectory); err != nil {
+	if err := ValidateUnitPath("working directory", o.WorkingDirectory); err != nil {
 		return nil, err
 	}
-	if err := validateUnitPropertyPath("log path", o.LogPath); err != nil {
+	if err := ValidateUnitPath("log path", o.LogPath); err != nil {
 		return nil, err
 	}
 
@@ -131,6 +133,11 @@ func unitArgv(o UnitArgvOptions) ([]string, error) {
 		// control-group guarantees systemctl stop takes down dsh, node
 		// workers and any tool subprocess even if the agent is wedged.
 		"-p", "KillMode=control-group",
+		// The agent publishes exit_code=143 when it handles SIGTERM, so a
+		// controlled `systemctl stop` must not make systemd mark the unit
+		// failed. Without this, every normal stop leaves a failed transient
+		// unit behind until an explicit reset-failed.
+		"-p", "SuccessExitStatus=143",
 		"-p", "TimeoutStopSec="+formatTimeSpan(grace),
 		// Property form, not --working-directory: the latter only exists in
 		// newer systemd and makes every start fail on v239-family hosts.

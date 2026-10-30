@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/seqyuan/deepwarper/internal/auth"
+	"github.com/seqyuan/deepwarper/internal/pathutil"
 )
 
 // ErrEmptyPlan is returned when there is nothing to sandbox, so the caller
@@ -76,6 +77,9 @@ type Input struct {
 	// read-only bind-mounted onto the same path. Build does not stat them.
 	HostBinds []string
 	Command   []string
+	// ResolvePath resolves a host path physically before it is trusted.
+	// Defaults to pathutil.Resolve; tests inject a fake to avoid real mounts.
+	ResolvePath func(string) (string, error)
 }
 
 type rootsFile struct {
@@ -168,6 +172,9 @@ func Build(in Input) (Plan, error) {
 		"--unshare-pid",
 		"--proc", "/proc",
 		"--dev", "/dev",
+		// A private shm keeps node/uv thread pools and tool IPC working without
+		// exposing the host's shared memory.
+		"--tmpfs", "/dev/shm",
 		"--tmpfs", "/tmp",
 	}
 	for _, p := range in.HostBinds {
@@ -180,7 +187,12 @@ func Build(in Input) (Plan, error) {
 		argv = append(argv, "--ro-bind", in.Moniforge, in.Moniforge)
 	}
 	argv = append(argv, "--bind", in.Workspace, "/workspace")
+	// Home is visible as /home/dsh (DSH_HOME) and again at the host path so
+	// absolute plugin paths written into user-cordis.patch.yml still resolve.
 	argv = append(argv, "--bind", in.DSHHome, "/home/dsh")
+	if filepath.Clean(in.DSHHome) != "/home/dsh" {
+		argv = append(argv, "--bind", in.DSHHome, in.DSHHome)
+	}
 	if in.Dist != "" {
 		// The profile's node_modules symlink uses the absolute dist path.
 		argv = append(argv, "--ro-bind", in.Dist, in.Dist)
@@ -198,25 +210,31 @@ func Build(in Input) (Plan, error) {
 	}
 
 	var rclone []RcloneMount
+	resolve := in.ResolvePath
+	if resolve == nil {
+		resolve = pathutil.Resolve
+	}
 	for _, m := range in.Mounts {
 		switch m.Kind {
 		case "path":
 			if err := checkMountName(m.Name); err != nil {
 				return Plan{}, err
 			}
-			host, err := cleanHost(m.Host)
-			if err != nil {
+			if _, err := cleanHost(m.Host); err != nil {
 				return Plan{}, err
 			}
 			if err := checkTarget(m.Target, m.Mode); err != nil {
 				return Plan{}, err
 			}
-			root, err := oneRoot(host, in.Roots)
+			root, host, err := physicalRoot(m.Host, in.Roots, resolve)
 			if err != nil {
 				return Plan{}, err
 			}
 			if m.Mode == "rw" && !root.AllowRW {
 				return Plan{}, fmt.Errorf("mount: root %s does not allow rw", root.ID)
+			}
+			if strings.HasPrefix(m.Target, "/data/") && !hasSeqArg(argv, "--dir", "/data") {
+				argv = append(argv, "--dir", "/data")
 			}
 			flag := "--ro-bind"
 			if m.Mode == "rw" {
@@ -253,30 +271,45 @@ func Build(in Input) (Plan, error) {
 		argv = append(argv, in.Command...)
 	}
 
-	env := []string{"HOME=/home/dsh", "DSH_HOME=/home/dsh"}
-	if in.Moniforge != "" {
-		env = append(env, "PATH="+sandboxPATH(in))
-	}
+	env := []string{"HOME=/home/dsh", "DSH_HOME=/home/dsh", "PATH=" + sandboxPATH(in)}
 	return Plan{BwrapArgv: argv, Rclone: rclone, Env: env}, nil
 }
 
 // sandboxPATH is dsh's bin directory, then moniforge's bin, then /opt/dw/env
-// when dw-env is installed there. node stays ahead of moniforge.
+// when dw-env is installed there, then the system bins. Every component is
+// absolute and deduplicated; an empty or relative entry would let PATH lookup
+// resolve against the workspace.
 func sandboxPATH(in Input) string {
 	var parts []string
-	if len(in.Command) > 0 && in.Command[0] != "" {
-		dir := filepath.Dir(in.Command[0])
-		if dir != "" && dir != "." {
-			parts = append(parts, dir)
+	add := func(p string) {
+		if p == "" || !filepath.IsAbs(p) {
+			return
 		}
+		p = filepath.Clean(p)
+		if p == string(filepath.Separator) {
+			return
+		}
+		for _, existing := range parts {
+			if existing == p {
+				return
+			}
+		}
+		parts = append(parts, p)
 	}
-	parts = append(parts, filepath.Join(in.Moniforge, "bin"))
+	if len(in.Command) > 0 {
+		add(filepath.Dir(in.Command[0]))
+	}
+	if in.Moniforge != "" {
+		add(filepath.Join(in.Moniforge, "bin"))
+	}
 	if in.BinDir != "" {
-		parts = append(parts, "/opt/dw/env")
+		add("/opt/dw/env")
 	}
 	// The wrapper calls rclone, grep, sleep, fusermount, and umount by path
 	// or by name. Keep those directories after the toolchain bins.
-	parts = append(parts, "/usr/bin", "/bin")
+	for _, p := range []string{"/usr/local/bin", "/usr/bin", "/bin"} {
+		add(p)
+	}
 	return strings.Join(parts, string(os.PathListSeparator))
 }
 
@@ -386,22 +419,26 @@ func planBucket(in Input, m auth.Mount, rcloneBin string) (RcloneMount, string, 
 	return RcloneMount{Name: m.Name, Argv: rcArgv, MountPoint: hostPoint}, hostPoint, nil
 }
 
-// ValidateMount applies the target, name, and root checks Build uses.
+// ValidateMount applies the target, name, and root checks Build uses, with the
+// same physical resolution: a symlink under a root may not escape it.
 // A path mount must sit under exactly one root. A bucket mount does not.
 func ValidateMount(m auth.Mount, roots []Root) error {
+	return validateMountWith(m, roots, pathutil.Resolve)
+}
+
+func validateMountWith(m auth.Mount, roots []Root, resolve func(string) (string, error)) error {
 	if err := checkMountName(m.Name); err != nil {
 		return err
 	}
 	switch m.Kind {
 	case "path":
-		host, err := cleanHost(m.Host)
-		if err != nil {
+		if _, err := cleanHost(m.Host); err != nil {
 			return err
 		}
 		if err := checkTarget(m.Target, m.Mode); err != nil {
 			return err
 		}
-		root, err := oneRoot(host, roots)
+		root, _, err := physicalRoot(m.Host, roots, resolve)
 		if err != nil {
 			return err
 		}
@@ -415,9 +452,6 @@ func ValidateMount(m auth.Mount, roots []Root) error {
 		}
 		if err := checkTarget(m.Target, m.Mode); err != nil {
 			return err
-		}
-		if !strings.HasPrefix(m.Target, "/data/") && !strings.HasPrefix(m.Target, "/workspace/") {
-			return fmt.Errorf("mount: bucket target %q must be /data/<name> or /workspace/<name>", m.Target)
 		}
 		return checkPrefix(m.Prefix)
 	default:
@@ -434,22 +468,17 @@ func checkTarget(target, mode string) error {
 	if mode != "ro" && mode != "rw" {
 		return fmt.Errorf("mount: mode %q is not ro or rw", mode)
 	}
-	ok := target == "/workspace"
+	rest, ok := strings.CutPrefix(target, "/data/")
 	if !ok {
-		if rest, found := strings.CutPrefix(target, "/data/"); found && singleSegment(rest) {
-			ok = true
-		}
+		rest, ok = strings.CutPrefix(target, "/workspace/")
 	}
-	if !ok {
-		if rest, found := strings.CutPrefix(target, "/workspace/"); found && singleSegment(rest) {
-			ok = true
-		}
-	}
-	if !ok {
+	if !ok || !singleSegment(rest) {
+		// "/workspace" itself is reserved for the private workspace bind;
+		// a mount there would silently shadow it.
 		return fmt.Errorf("mount: invalid target %q", target)
 	}
-	if mode == "rw" && target != "/workspace" && !strings.HasPrefix(target, "/workspace/") {
-		return fmt.Errorf("mount: rw is only allowed under /workspace (target %q)", target)
+	if mode == "rw" && !strings.HasPrefix(target, "/workspace/") {
+		return fmt.Errorf("mount: rw is only allowed under /workspace/<name> (target %q)", target)
 	}
 	return nil
 }
@@ -498,21 +527,36 @@ func cleanHost(host string) (string, error) {
 	return cleaned, nil
 }
 
-func oneRoot(host string, roots []Root) (Root, error) {
+// physicalRoot resolves the host and every root, then requires exactly one
+// containing root. The returned host path is the physical path that is bound,
+// so a symlink inside a root cannot redirect the bind elsewhere.
+func physicalRoot(host string, roots []Root, resolve func(string) (string, error)) (Root, string, error) {
+	realHost, err := resolve(host)
+	if err != nil {
+		return Root{}, "", fmt.Errorf("mount: host path %q: %w", host, err)
+	}
 	var match []Root
+	seen := map[string]bool{}
 	for _, r := range roots {
-		root := filepath.Clean(r.Host)
-		if root == "" || root == "." {
+		if strings.TrimSpace(r.Host) == "" {
 			continue
 		}
-		if host == root || strings.HasPrefix(host, root+string(filepath.Separator)) {
+		realRoot, rerr := resolve(r.Host)
+		if rerr != nil {
+			return Root{}, "", fmt.Errorf("mount: root %s: %w", r.ID, rerr)
+		}
+		if seen[realRoot] {
+			continue
+		}
+		seen[realRoot] = true
+		if pathutil.Within(realHost, realRoot) {
 			match = append(match, r)
 		}
 	}
 	if len(match) != 1 {
-		return Root{}, fmt.Errorf("mount: %q is under %d roots, want exactly one", host, len(match))
+		return Root{}, "", fmt.Errorf("mount: %q is under %d roots, want exactly one", realHost, len(match))
 	}
-	return match[0], nil
+	return match[0], realHost, nil
 }
 
 func hasSeqArg(argv []string, parts ...string) bool {

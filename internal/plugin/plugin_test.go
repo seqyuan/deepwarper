@@ -21,6 +21,10 @@ func TestEnableAndDisable(t *testing.T) {
 	if err := os.MkdirAll(office, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	marker := []byte("office-plugin-src\n")
+	if err := os.WriteFile(filepath.Join(office, "index.js"), marker, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	catalog := filepath.Join(t.TempDir(), "catalog.yaml")
 	writeCatalog(t, catalog, "office", office)
 
@@ -39,6 +43,34 @@ func TestEnableAndDisable(t *testing.T) {
 	if err := Enable(home, catalog, "office"); err != nil {
 		t.Fatal(err)
 	}
+	userPlug := filepath.Join(home, "plugins", "office")
+	copied, err := os.ReadFile(filepath.Join(userPlug, "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(copied) != string(marker) {
+		t.Fatalf("catalog plugin was not copied into the user home: %q", copied)
+	}
+	if err := os.WriteFile(filepath.Join(userPlug, "index.js"), []byte("user edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalogSrc, err := os.ReadFile(filepath.Join(office, "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(catalogSrc) != string(marker) {
+		t.Fatalf("editing the user copy mutated the catalog: %q", catalogSrc)
+	}
+	if err := Enable(home, catalog, "office"); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := os.ReadFile(filepath.Join(userPlug, "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(kept) != "user edit\n" {
+		t.Fatalf("re-enable overwrote the user plugin copy: %q", kept)
+	}
 	data, err := os.ReadFile(filepath.Join(home, "user-cordis.patch.yml"))
 	if err != nil {
 		t.Fatal(err)
@@ -46,8 +78,11 @@ func TestEnableAndDisable(t *testing.T) {
 	if strings.Count(string(data), "dw-plugin-office") != 1 {
 		t.Fatalf("duplicate or missing id: %s", data)
 	}
-	if !strings.Contains(string(data), office) {
-		t.Fatalf("plugin path missing: %s", data)
+	if !strings.Contains(string(data), userPlug) {
+		t.Fatalf("patch must point at the user copy, not the catalog: %s", data)
+	}
+	if strings.Contains(string(data), office) {
+		t.Fatalf("catalog path leaked into the patch: %s", data)
 	}
 	got, err := os.ReadFile(profile)
 	if err != nil {
@@ -66,7 +101,7 @@ func TestEnableAndDisable(t *testing.T) {
 		t.Fatal("missing plugin path was enabled")
 	}
 
-	foreign := "- id: session-log-deepseek\n  config:\n    enabled: false\n- id: dw-plugin-office\n  plugin: " + office + "\n"
+	foreign := "- id: session-log-deepseek\n  config:\n    enabled: false\n- id: dw-plugin-office\n  plugin: " + userPlug + "\n"
 	if err := os.WriteFile(filepath.Join(home, "user-cordis.patch.yml"), []byte(foreign), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -82,6 +117,9 @@ func TestEnableAndDisable(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "session-log-deepseek") || !strings.Contains(string(data), "enabled: false") {
 		t.Fatalf("foreign row was removed: %s", data)
+	}
+	if _, err := os.Stat(userPlug); err != nil {
+		t.Fatalf("disable must leave the user plugin copy: %v", err)
 	}
 	if err := Disable(home, "office"); err == nil {
 		t.Fatal("disable of missing plugin succeeded")
@@ -135,14 +173,20 @@ func TestReconcileRemovesUnlistedPlugins(t *testing.T) {
 	}
 }
 
-func TestEnableReplacesCatalogPath(t *testing.T) {
+func TestEnableKeepsUserCopyWhenCatalogMoves(t *testing.T) {
 	home := t.TempDir()
 	first := filepath.Join(t.TempDir(), "office")
 	second := filepath.Join(t.TempDir(), "office2")
 	if err := os.MkdirAll(first, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(first, "a.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(second, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(second, "a.txt"), []byte("v2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	catalog := filepath.Join(t.TempDir(), "catalog.yaml")
@@ -154,12 +198,20 @@ func TestEnableReplacesCatalogPath(t *testing.T) {
 	if err := Enable(home, catalog, "office"); err != nil {
 		t.Fatal(err)
 	}
+	userPlug := filepath.Join(home, "plugins", "office")
 	data, err := os.ReadFile(filepath.Join(home, "user-cordis.patch.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(data), "dw-plugin-office") != 1 || !strings.Contains(string(data), second) || strings.Contains(string(data), first) {
-		t.Fatalf("path was not replaced: %s", data)
+	if strings.Count(string(data), "dw-plugin-office") != 1 || !strings.Contains(string(data), userPlug) {
+		t.Fatalf("patch must keep pointing at the user copy: %s", data)
+	}
+	got, err := os.ReadFile(filepath.Join(userPlug, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "v1\n" {
+		t.Fatalf("catalog move must not overwrite an existing user copy: %q", got)
 	}
 }
 

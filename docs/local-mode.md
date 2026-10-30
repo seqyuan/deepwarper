@@ -195,3 +195,14 @@ $ DW_TEST_SYSTEMD=1 DW_TEST_SYSTEMD_DW=$PWD/dw go test ./internal/runtime/local 
 - 回退路径没有 RSS 级内存上限，也没有 fork 炸弹防护（`RLIMIT_NPROC` 不可用），记录里的 `limiter` 字段会如实标注。
 - 运行时只有本机进程：每个用户一个 dsh，由 systemd user unit 或普通子进程拉起。
 - 平台鉴权为 Bearer token；HMAC/ticket 持久化接口已留。
+
+## 9. 安全与运维约束（本轮加固）
+
+- `dw serve` 对 dataDir 持有单实例锁（`locks/serve.lock`）：第二个控制面进程直接退出，避免两份进程互相覆盖实例记录与端口。
+- 实例进入 `stopping` 后不会立即释放端口/句柄；停止失败按 `scanInterval`（≥10s）重试，最多 5 次后记录 `orphan suspected`。记录为 `stopping` 时再次 launch 返回 409 + `Retry-After`。
+- 端口按 incarnation 归属：控制面重启会为所有活跃记录重新 reserve，旧 incarnation 不能释放新进程的端口。
+- `dw del <user>` 写 tombstone（`deleted: true`，清空口令/挂载/插件并推进 `session_version`）；同名 `dw user` 重建继承更高代次，删除前的 `dw_session` 永久失效。
+- workspace 只能落在 `<dataDir>/workspaces/<slug>` 或 `server.workspaceRoots` 内；挂载 host 路径做 realpath 并校验根目录，路径挂载目标不能是 `/workspace`。
+- 网关对 `/login`、`/_dw/launch`、`/_dw/plugins`、`/_dw/mounts` 和 `/` 校验 Host（仅 apex 或一级子域），其它 Host 返回 421；`/_dw/launch` 只对有效 ticket 写 `.used`，过期 ticket 由 janitor 清理。
+- 登录失败按 IP 与 IP|用户名 限速（默认 10 次 / 5 分钟、锁定 5 分钟，返回 429 + `Retry-After`），成功登录清零。
+- 反向代理场景设置 `routing.publicScheme: https` + `routing.publicPort: 443`（需要时加 `trustProxyHeaders: true`）；否则实例 URL 会带 `:7658`，Origin 校验也会按 http 端口比较。

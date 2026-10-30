@@ -296,6 +296,25 @@ func TestPrefixCommand(t *testing.T) {
 	if strings.Contains(text, spec.PatchPath) {
 		t.Fatalf("host patch path leaked into the sandbox command: %s", text)
 	}
+
+	spec.Home = "/var/lib/dw/homes/alice"
+	spec.ExtraPatches = []string{"/var/lib/dw/homes/alice/user-cordis.patch.yml"}
+	argv, err = prefixCommand(spec, func(name string) (string, error) {
+		if name == "bwrap" {
+			return "/usr/bin/bwrap", nil
+		}
+		return "", os.ErrNotExist
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = strings.Join(argv, " ")
+	if !strings.Contains(text, "--patch /home/dsh/user-cordis.patch.yml") {
+		t.Fatalf("user patch must be rewritten under /home/dsh: %s", text)
+	}
+	if strings.Contains(text, "--patch /var/lib/dw/homes/alice/user-cordis.patch.yml") {
+		t.Fatalf("host user patch path leaked into the sandbox command: %s", text)
+	}
 }
 
 func TestSandboxEnvDropsHostSecrets(t *testing.T) {
@@ -467,4 +486,80 @@ func TestPortZeroIsPickedOnThisHost(t *testing.T) {
 		t.Fatalf("the probe leaked a listening socket: %v", err)
 	}
 	_ = conn.Close()
+}
+
+func TestSpecInvalidPublishesFailure(t *testing.T) {
+	root := t.TempDir()
+	control := filepath.Join(root, "control")
+	spec := Spec{
+		InstanceID:  "alice-default",
+		Incarnation: "inc1",
+		ControlDir:  control,
+		// Home and Workspace are deliberately empty.
+	}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(root, "spec.json")
+	if err := os.WriteFile(specPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := Run(t.Context(), specPath); code != ExitSpecInvalid {
+		t.Fatalf("exit code: %d want %d", code, ExitSpecInvalid)
+	}
+	if got := readControl(t, control, "state"); got != "failed" {
+		t.Fatalf("state: %q", got)
+	}
+	if got := readControl(t, control, "exit_code"); got != "2" {
+		t.Fatalf("exit_code: %q", got)
+	}
+	if got := readControl(t, control, "incarnation"); got != "inc1" {
+		t.Fatalf("incarnation: %q", got)
+	}
+	if got := readControl(t, control, "message"); !strings.Contains(got, "control_dir") {
+		t.Fatalf("message: %q", got)
+	}
+}
+
+func TestRcloneFailurePublishesFailure(t *testing.T) {
+	specPath, controlDir := testSpec(t, slowDsh(t), "30s")
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatal(err)
+	}
+	spec.Rclone = []RcloneSpec{{
+		Name:       "raw",
+		Argv:       []string{filepath.Join(t.TempDir(), "missing-rclone"), "mount"},
+		MountPoint: filepath.Join(t.TempDir(), "raw"),
+	}}
+	data, err = json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(specPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := Run(t.Context(), specPath); code != ExitDshStartFailed {
+		t.Fatalf("exit code: %d want %d", code, ExitDshStartFailed)
+	}
+	if got := readControl(t, controlDir, "state"); got != "failed" {
+		t.Fatalf("state: %q", got)
+	}
+	if got := readControl(t, controlDir, "exit_code"); got != "9" {
+		t.Fatalf("exit_code: %q", got)
+	}
+	if got := readControl(t, controlDir, "message"); !strings.Contains(got, "rclone mount") {
+		t.Fatalf("message: %q", got)
+	}
+}
+
+func TestUnmountStaleIsNoopWhenNotMounted(t *testing.T) {
+	if err := unmountStale(filepath.Join(t.TempDir(), "not-mounted")); err != nil {
+		t.Fatalf("not-mounted path: %v", err)
+	}
 }

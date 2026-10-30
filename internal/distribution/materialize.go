@@ -76,8 +76,14 @@ func Materialize(home string, dist config.DistSpec) error {
 		}
 	}
 
-	for _, dir := range []string{"sessions", "skills"} {
+	for _, dir := range []string{"sessions", "skills", "plugins"} {
 		if err := os.MkdirAll(filepath.Join(home, dir), 0o700); err != nil {
+			return err
+		}
+	}
+	userPatch := filepath.Join(home, "user-cordis.patch.yml")
+	if _, err := os.Stat(userPatch); os.IsNotExist(err) {
+		if err := os.WriteFile(userPatch, []byte("[]\n"), 0o600); err != nil {
 			return err
 		}
 	}

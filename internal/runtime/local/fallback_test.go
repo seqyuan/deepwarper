@@ -2,13 +2,19 @@ package local
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/seqyuan/deepwarper/internal/agent"
+	"github.com/seqyuan/deepwarper/internal/model"
+	"github.com/seqyuan/deepwarper/internal/rendezvous"
+	"github.com/seqyuan/deepwarper/internal/runtime"
 )
 
 const fakeDwScript = `#!/bin/sh
@@ -152,5 +158,172 @@ func TestStopRefusesPIDWithoutMatchingSpec(t *testing.T) {
 	}
 	if !processAlive(pid, 0) {
 		t.Fatal("a legacy pid without a matching spec must not be signalled")
+	}
+}
+
+func TestProcessEndpointFailsFastWhenAgentExits(t *testing.T) {
+	spec := fallbackSpec(t)
+	dw := filepath.Join(t.TempDir(), "dw-exit")
+	if err := os.WriteFile(dw, []byte("#!/bin/sh\nexit 3\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b := New(Options{DwBin: dw, Limiter: "none", ReadyWait: 30 * time.Second})
+	h, err := b.Start(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := h.Endpoint(context.Background(), 30*time.Second); err == nil {
+		t.Fatal("an exited agent must fail the launch")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("process-mode endpoint did not fail fast: %s", elapsed)
+	}
+	_ = h.Stop(context.Background())
+}
+
+// startSleep starts a reaped `sleep` process in its own process group, so
+// stopRecordedProcess can terminate it with the group signal it uses in
+// production.
+func startSleep(t *testing.T) (pid int, start uint64) {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid = cmd.Process.Pid
+	start = pidStartTime(pid)
+	if start == 0 {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Skip("no /proc starttime on this host")
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = cmd.Process.Kill()
+		<-exited
+	})
+	return pid, start
+}
+
+func TestStopAndProbeUseControlDirPIDFallback(t *testing.T) {
+	control := t.TempDir()
+	pid, start := startSleep(t)
+	for name, value := range map[string]string{
+		"incarnation": "inc-fallback",
+		"pid":         fmt.Sprint(pid),
+		"pid_start":   fmt.Sprint(start),
+	} {
+		if err := rendezvous.WriteString(control, name, value, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := New(Options{DwBin: "/path/to/dw", Limiter: "none", StopGrace: time.Second,
+		Run: &fakeRunner{paths: map[string]string{}}})
+	inst := &model.Instance{ID: "alice-default", Incarnation: "inc-fallback", ControlDir: control}
+
+	obs, err := b.Probe(context.Background(), inst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !obs.Alive() || obs.PID != pid {
+		t.Fatalf("control-dir pid was not probed: %#v", obs)
+	}
+
+	if err := b.Stop(context.Background(), inst); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if processAlive(pid, 0) {
+		t.Fatalf("control-dir pid %d survived Stop", pid)
+	}
+	obs, err = b.Probe(context.Background(), inst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Alive() || obs.Phase != runtime.PhaseInactive {
+		t.Fatalf("stopped pid must probe inactive: %#v", obs)
+	}
+}
+
+func TestControlDirPIDIsIncarnationChecked(t *testing.T) {
+	control := t.TempDir()
+	pid, start := startSleep(t)
+	for name, value := range map[string]string{
+		"incarnation": "another-incarnation",
+		"pid":         fmt.Sprint(pid),
+		"pid_start":   fmt.Sprint(start),
+	} {
+		if err := rendezvous.WriteString(control, name, value, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := New(Options{DwBin: "/path/to/dw", Limiter: "none", StopGrace: time.Second,
+		Run: &fakeRunner{paths: map[string]string{}}})
+	inst := &model.Instance{ID: "alice-default", Incarnation: "inc-wanted", ControlDir: control}
+
+	obs, err := b.Probe(context.Background(), inst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Alive() {
+		t.Fatalf("a foreign incarnation's pid must not be probed: %#v", obs)
+	}
+	if err := b.Stop(context.Background(), inst); err != nil {
+		t.Fatal(err)
+	}
+	if !processAlive(pid, 0) {
+		t.Fatal("a foreign incarnation's pid must not be signalled")
+	}
+}
+
+func TestStopWithoutPIDOrSystemctlIsNoop(t *testing.T) {
+	f := &fakeRunner{paths: map[string]string{}}
+	b := New(Options{DwBin: "/path/to/dw", Limiter: "none", Run: f})
+	inst := &model.Instance{
+		ID:          "alice-default",
+		Incarnation: "inc1",
+		State:       model.StatePending,
+		UnitName:    "dw-alice-0.service",
+		ControlDir:  filepath.Join(t.TempDir(), "control"),
+	}
+	if err := b.Stop(context.Background(), inst); err != nil {
+		t.Fatalf("a process-mode stop without a pid must not fail: %v", err)
+	}
+	if calls := f.recorded(); len(calls) != 0 {
+		t.Fatalf("systemd must not be invoked without systemctl: %#v", calls)
+	}
+}
+
+func TestStopAdoptsPendingUnitWithoutBackendRef(t *testing.T) {
+	f := &fakeRunner{
+		paths: map[string]string{"systemctl": "/usr/bin/systemctl"},
+		handler: func(name string, args []string) (RunResult, error) {
+			if name == "systemctl" {
+				if verb, _ := systemctlArgs(args); verb == "show" {
+					return showOutput("inactive", 0, "success", 0), nil
+				}
+			}
+			return RunResult{}, nil
+		},
+	}
+	b := New(Options{DwBin: "/path/to/dw", Limiter: "systemd", SystemdUser: "always", StopGrace: time.Second, Run: f})
+	inst := &model.Instance{
+		ID:          "alice-default",
+		Incarnation: "inc1",
+		State:       model.StatePending,
+		UnitName:    "dw-alice-0.service",
+		ControlDir:  t.TempDir(),
+	}
+	if err := b.Stop(context.Background(), inst); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if !hasCall(f, "systemctl", "stop") {
+		t.Fatalf("the pending unit was not stopped: %#v", f.recorded())
 	}
 }

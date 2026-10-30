@@ -12,16 +12,42 @@ import (
 
 func baseInput(t *testing.T) Input {
 	t.Helper()
+	root := t.TempDir()
+	data := filepath.Join(root, "srv", "data")
+	work := filepath.Join(root, "srv", "work")
+	for _, d := range []string{data, work, filepath.Join(root, "homes", "alice"), filepath.Join(root, "ws", "alice")} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return Input{
-		DSHHome:   "/var/lib/dw/homes/alice",
-		Workspace: "/var/lib/dw/ws/alice",
+		DSHHome:   filepath.Join(root, "homes", "alice"),
+		Workspace: filepath.Join(root, "ws", "alice"),
 		Roots: []Root{
-			{ID: "data", Host: "/srv/data", AllowRW: false},
-			{ID: "work", Host: "/srv/work", AllowRW: true},
+			{ID: "data", Host: data, AllowRW: false},
+			{ID: "work", Host: work, AllowRW: true},
 		},
-		FuseDir: filepath.Join(t.TempDir(), "fuse"),
+		FuseDir: filepath.Join(root, "fuse"),
 		Command: []string{"/opt/dw/bin/dsh", "--profile", "default"},
 	}
+}
+
+// rootHost returns an existing host path under the named root. Every path
+// mount is resolved physically, so the fixture must exist.
+func rootHost(t *testing.T, in Input, rootID, rel string) string {
+	t.Helper()
+	for _, r := range in.Roots {
+		if r.ID != rootID {
+			continue
+		}
+		path := filepath.Join(r.Host, rel)
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Fatalf("no root %q", rootID)
+	return ""
 }
 
 func hasSeq(argv []string, parts ...string) bool {
@@ -73,6 +99,9 @@ func TestBuildPrivateView(t *testing.T) {
 	if !hasSeq(plan.BwrapArgv, "--bind", in.DSHHome, "/home/dsh") {
 		t.Fatalf("home bind missing: %#v", plan.BwrapArgv)
 	}
+	if !hasSeq(plan.BwrapArgv, "--bind", in.DSHHome, in.DSHHome) {
+		t.Fatalf("home host-path bind missing for absolute plugin paths: %#v", plan.BwrapArgv)
+	}
 	if !hasSeq(plan.BwrapArgv, "--", "/opt/dw/bin/dsh", "--profile", "default") {
 		t.Fatalf("command missing: %#v", plan.BwrapArgv)
 	}
@@ -99,38 +128,47 @@ func TestBuildPrivateView(t *testing.T) {
 
 func TestBuildLocalMounts(t *testing.T) {
 	in := baseInput(t)
+	ref := rootHost(t, in, "data", "ref")
 	in.Mounts = []auth.Mount{{
-		Name: "ref", Kind: "path", Host: "/srv/data/ref", Target: "/data/ref", Mode: "ro",
+		Name: "ref", Kind: "path", Host: ref, Target: "/data/ref", Mode: "ro",
 	}}
 	plan, err := Build(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasSeq(plan.BwrapArgv, "--ro-bind", "/srv/data/ref", "/data/ref") {
+	if !hasSeq(plan.BwrapArgv, "--ro-bind", ref, "/data/ref") {
 		t.Fatalf("ro bind missing: %#v", plan.BwrapArgv)
 	}
+	if !hasSeq(plan.BwrapArgv, "--dir", "/data") {
+		t.Fatalf("path mount under /data must create /data: %#v", plan.BwrapArgv)
+	}
 
+	proj := rootHost(t, in, "work", "proj")
 	in.Mounts = []auth.Mount{{
-		Name: "proj", Kind: "path", Host: "/srv/work/proj", Target: "/workspace/proj", Mode: "rw",
+		Name: "proj", Kind: "path", Host: proj, Target: "/workspace/proj", Mode: "rw",
 	}}
 	plan, err = Build(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasSeq(plan.BwrapArgv, "--bind", "/srv/work/proj", "/workspace/proj") {
+	if !hasSeq(plan.BwrapArgv, "--bind", proj, "/workspace/proj") {
 		t.Fatalf("rw bind missing: %#v", plan.BwrapArgv)
 	}
 }
 
 func TestBuildRejectsBadLocalMounts(t *testing.T) {
+	fixture := baseInput(t)
+	roRef := rootHost(t, fixture, "data", "ref")
+	rwProj := rootHost(t, fixture, "work", "proj")
 	cases := []auth.Mount{
-		{Name: "x", Kind: "path", Host: "/srv/data/../etc", Target: "/data/x", Mode: "ro"},
+		{Name: "x", Kind: "path", Host: filepath.Join(filepath.Dir(filepath.Dir(roRef)), "data", "..", "etc"), Target: "/data/x", Mode: "ro"},
 		{Name: "x", Kind: "path", Host: "/etc/passwd", Target: "/data/x", Mode: "ro"},
-		{Name: "x", Kind: "path", Host: "/srv/data/ref", Target: "/workspace/proj", Mode: "rw"},
-		{Name: "x", Kind: "path", Host: "/srv/work/proj", Target: "/data/proj", Mode: "rw"},
-		{Name: "x", Kind: "path", Host: "/srv/work/proj", Target: "/data/a/b", Mode: "ro"},
-		{Name: "x", Kind: "path", Host: "/srv/work/proj", Target: "/workspace/a/b", Mode: "ro"},
-		{Name: "x", Kind: "path", Host: "/srv/work/proj", Target: "/tmp/x", Mode: "ro"},
+		{Name: "x", Kind: "path", Host: roRef, Target: "/workspace/proj", Mode: "rw"},
+		{Name: "x", Kind: "path", Host: rwProj, Target: "/data/proj", Mode: "rw"},
+		{Name: "x", Kind: "path", Host: rwProj, Target: "/data/a/b", Mode: "ro"},
+		{Name: "x", Kind: "path", Host: rwProj, Target: "/workspace/a/b", Mode: "ro"},
+		{Name: "x", Kind: "path", Host: rwProj, Target: "/workspace", Mode: "ro"},
+		{Name: "x", Kind: "path", Host: rwProj, Target: "/tmp/x", Mode: "ro"},
 		{Name: "x", Kind: "path", Host: "", Target: "/data/x", Mode: "ro"},
 	}
 	for _, m := range cases {
@@ -142,12 +180,14 @@ func TestBuildRejectsBadLocalMounts(t *testing.T) {
 	}
 
 	in := baseInput(t)
+	dataRoot := in.Roots[0].Host
 	in.Roots = []Root{
-		{ID: "wide", Host: "/srv", AllowRW: true},
-		{ID: "data", Host: "/srv/data", AllowRW: false},
+		{ID: "wide", Host: filepath.Dir(filepath.Dir(dataRoot)), AllowRW: true},
+		{ID: "data", Host: dataRoot, AllowRW: false},
 	}
+	ref := rootHost(t, in, "data", "ref")
 	in.Mounts = []auth.Mount{{
-		Name: "x", Kind: "path", Host: "/srv/data/ref", Target: "/data/ref", Mode: "ro",
+		Name: "x", Kind: "path", Host: ref, Target: "/data/ref", Mode: "ro",
 	}}
 	if _, err := Build(in); err == nil {
 		t.Fatal("path under two roots was accepted")
@@ -155,8 +195,9 @@ func TestBuildRejectsBadLocalMounts(t *testing.T) {
 }
 
 func TestBuildAcceptsCleanedPathInsideRoot(t *testing.T) {
-	for _, host := range []string{"/srv/data/./ref", "/srv/data//ref"} {
-		in := baseInput(t)
+	in := baseInput(t)
+	ref := rootHost(t, in, "data", "ref")
+	for _, host := range []string{filepath.Join(in.Roots[0].Host, ".", "ref"), in.Roots[0].Host + "//ref"} {
 		in.Mounts = []auth.Mount{{
 			Name: "ref", Kind: "path", Host: host, Target: "/data/ref", Mode: "ro",
 		}}
@@ -164,7 +205,7 @@ func TestBuildAcceptsCleanedPathInsideRoot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", host, err)
 		}
-		if !hasSeq(plan.BwrapArgv, "--ro-bind", "/srv/data/ref", "/data/ref") {
+		if !hasSeq(plan.BwrapArgv, "--ro-bind", ref, "/data/ref") {
 			t.Fatalf("%s cleaned bind missing: %#v", host, plan.BwrapArgv)
 		}
 	}
@@ -370,7 +411,7 @@ func TestTargetSegmentCharset(t *testing.T) {
 	for _, seg := range []string{"raw"} {
 		in := baseInput(t)
 		in.Mounts = []auth.Mount{{
-			Name: seg, Kind: "path", Host: "/srv/data/ref", Target: "/data/" + seg, Mode: "ro",
+			Name: seg, Kind: "path", Host: rootHost(t, in, "data", "ref"), Target: "/data/" + seg, Mode: "ro",
 		}}
 		if _, err := Build(in); err != nil {
 			t.Fatalf("path target %s: %v", seg, err)
@@ -394,7 +435,7 @@ func TestTargetSegmentCharset(t *testing.T) {
 			in := baseInput(t)
 			in.Remotes = remote
 			in.Mounts = []auth.Mount{{
-				Name: "raw", Kind: kind, Host: "/srv/data/ref", Remote: "tos1", Prefix: "proj/raw", Target: target, Mode: "ro",
+				Name: "raw", Kind: kind, Host: rootHost(t, in, "data", "ref"), Remote: "tos1", Prefix: "proj/raw", Target: target, Mode: "ro",
 			}}
 			if _, err := Build(in); err == nil {
 				t.Fatalf("%s target %q was accepted", kind, target)
@@ -487,5 +528,99 @@ func TestLoadRootsAndRemotes(t *testing.T) {
 	}
 	if len(remotes) != 1 || remotes[0].Name != "tos1" || remotes[0].Bucket != "data" || remotes[0].CredentialFile != "/tmp/cred" {
 		t.Fatalf("remotes: %+v", remotes)
+	}
+}
+
+func TestBuildRejectsSymlinkEscape(t *testing.T) {
+	in := baseInput(t)
+	outside := t.TempDir()
+	link := filepath.Join(in.Roots[0].Host, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	in.Mounts = []auth.Mount{{
+		Name: "escape", Kind: "path", Host: link, Target: "/data/escape", Mode: "ro",
+	}}
+	if _, err := Build(in); err == nil {
+		t.Fatal("a symlink escaping its root was accepted")
+	}
+	if err := ValidateMount(in.Mounts[0], in.Roots); err == nil {
+		t.Fatal("ValidateMount accepted a symlink escape")
+	}
+}
+
+func TestBuildBindsPhysicalHostPath(t *testing.T) {
+	in := baseInput(t)
+	target := rootHost(t, in, "data", "real")
+	link := filepath.Join(in.Roots[0].Host, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	in.Mounts = []auth.Mount{{
+		Name: "link", Kind: "path", Host: link, Target: "/data/link", Mode: "ro",
+	}}
+	plan, err := Build(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasSeq(plan.BwrapArgv, "--ro-bind", target, "/data/link") {
+		t.Fatalf("bind must use the physical path: %#v", plan.BwrapArgv)
+	}
+}
+
+func TestValidateMountRejectsWorkspaceRoot(t *testing.T) {
+	in := baseInput(t)
+	host := rootHost(t, in, "work", "proj")
+	for _, m := range []auth.Mount{
+		{Name: "x", Kind: "path", Host: host, Target: "/workspace", Mode: "ro"},
+		{Name: "x", Kind: "path", Host: host, Target: "/workspace", Mode: "rw"},
+	} {
+		if err := ValidateMount(m, in.Roots); err == nil {
+			t.Fatalf("target /workspace was accepted: %+v", m)
+		}
+	}
+}
+
+func TestBuildAlwaysSetsSandboxPATH(t *testing.T) {
+	in := baseInput(t)
+	in.Dist = "/opt/dw/dist/default"
+	plan, err := Build(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sep := string(os.PathListSeparator)
+	var path string
+	found := false
+	for _, kv := range plan.Env {
+		if strings.HasPrefix(kv, "PATH=") {
+			path = strings.TrimPrefix(kv, "PATH=")
+			found = true
+		}
+	}
+	if !found || path == "" {
+		t.Fatalf("PATH must always be planned: %#v", plan.Env)
+	}
+	if strings.HasPrefix(path, sep) || strings.HasSuffix(path, sep) || strings.Contains(path, sep+sep) {
+		t.Fatalf("PATH has an empty component: %q", path)
+	}
+	for _, part := range strings.Split(path, sep) {
+		if !filepath.IsAbs(part) {
+			t.Fatalf("PATH component %q is not absolute: %q", part, path)
+		}
+	}
+	if !strings.HasSuffix(path, sep+"/usr/local/bin"+sep+"/usr/bin"+sep+"/bin") {
+		t.Fatalf("PATH tail: %q", path)
+	}
+}
+
+func TestBuildPrivateDevShm(t *testing.T) {
+	in := baseInput(t)
+	in.Dist = "/opt/dw/dist/default"
+	plan, err := Build(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasSeq(plan.BwrapArgv, "--dev", "/dev", "--tmpfs", "/dev/shm") {
+		t.Fatalf("private /dev/shm must follow --dev /dev: %#v", plan.BwrapArgv)
 	}
 }

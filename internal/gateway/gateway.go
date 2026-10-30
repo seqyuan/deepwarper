@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/seqyuan/deepwarper/internal/auth"
@@ -34,6 +36,12 @@ type Gateway struct {
 	ticketDir string
 	logger    *log.Logger
 	client    *http.Client
+
+	limiterOnce sync.Once
+	limiter     *loginLimiter
+
+	dshMu    sync.Mutex
+	dshLocks map[string]*sync.Mutex
 }
 
 type ticketRecord struct {
@@ -59,12 +67,15 @@ func New(cfg *config.Config, mgr *instance.Manager, logger *log.Logger) (*Gatewa
 	if err := os.MkdirAll(ticketDir, 0o700); err != nil {
 		return nil, err
 	}
+	max, window, lockout := cfg.LoginLimit()
 	return &Gateway{
 		cfg:       cfg,
 		mgr:       mgr,
 		key:       key,
 		ticketDir: ticketDir,
 		logger:    logger,
+		limiter:   newLoginLimiter(max, window, lockout),
+		dshLocks:  map[string]*sync.Mutex{},
 		client: &http.Client{
 			Timeout: 20 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -123,7 +134,15 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("/_dw/plugins", g.handlePlugins)
 	mux.HandleFunc("/_dw/mounts", g.handleMounts)
 	mux.HandleFunc("/", g.handleProxy)
-	return mux
+	// Host allowlist for every browser-facing route. A request for an
+	// unrelated Host is a DNS-rebinding/login-CSRF attempt, not a typo.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requiresHostCheck(r) && !g.hostAllowed(g.effectiveHost(r)) {
+			http.Error(w, "unexpected host", http.StatusMisdirectedRequest)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func (g *Gateway) handlePlatformLaunch(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +173,7 @@ func (g *Gateway) handlePlatformLaunch(w http.ResponseWriter, r *http.Request) {
 		Force:        body.Force,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		writeLaunchError(w, err)
 		return
 	}
 	t, err := g.issueTicket(inst)
@@ -171,6 +190,21 @@ func (g *Gateway) handlePlatformLaunch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func writeLaunchError(w http.ResponseWriter, err error) {
+	var busy *instance.BusyError
+	switch {
+	case errors.As(err, &busy), errors.Is(err, instance.ErrBusy):
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, instance.ErrInvalidRequest):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, instance.ErrUnknownUser):
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+	default:
+		http.Error(w, err.Error(), http.StatusBadGateway)
+	}
+}
+
 func (g *Gateway) issueTicket(inst *model.Instance) (string, error) {
 	raw := make([]byte, 24)
 	if _, err := rand.Read(raw); err != nil {
@@ -183,8 +217,11 @@ func (g *Gateway) issueTicket(inst *model.Instance) (string, error) {
 		Authority:  canonicalAuthority(inst.PublicHost),
 		Exp:        time.Now().Add(g.cfg.TicketTTL()).UTC(),
 	}
-	data, _ := json.Marshal(rec)
-	if err := os.WriteFile(g.ticketPath(t), data, 0o600); err != nil {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return "", err
+	}
+	if err := writeFileAtomic(g.ticketDir, g.ticketPath(t), data, 0o600); err != nil {
 		return "", err
 	}
 	return t, nil
@@ -195,14 +232,14 @@ func (g *Gateway) ticketPath(t string) string {
 	return filepath.Join(g.ticketDir, hex.EncodeToString(sum[:])+".json")
 }
 
+// consumeTicket validates a ticket before claiming it. Unknown, malformed,
+// expired and mismatched tickets therefore create no .used inode: an
+// unauthenticated /_dw/launch?ticket=random cannot fill the ticket directory.
 func (g *Gateway) consumeTicket(t, authority string) (*ticketRecord, error) {
-	path := g.ticketPath(t)
-	used := strings.TrimSuffix(path, ".json") + ".used"
-	f, err := os.OpenFile(used, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, errors.New("ticket already used")
+	if t == "" {
+		return nil, errors.New("unknown ticket")
 	}
-	_ = f.Close()
+	path := g.ticketPath(t)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, errors.New("unknown ticket")
@@ -211,25 +248,42 @@ func (g *Gateway) consumeTicket(t, authority string) (*ticketRecord, error) {
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return nil, errors.New("invalid ticket")
 	}
-	if time.Now().After(rec.Exp) {
+	if !rec.Exp.After(time.Now()) {
 		return nil, errors.New("ticket expired")
 	}
 	if rec.Authority != authority {
 		return nil, errors.New("ticket authority mismatch")
 	}
+	used := strings.TrimSuffix(path, ".json") + ".used"
+	f, err := os.OpenFile(used, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, errors.New("ticket already used")
+		}
+		return nil, errors.New("ticket unavailable")
+	}
+	_ = f.Close()
 	_ = os.Remove(path)
 	return &rec, nil
 }
 
 func (g *Gateway) handleLaunchTicket(w http.ResponseWriter, r *http.Request) {
-	auth := canonicalAuthority(r.Host)
-	rec, err := g.consumeTicket(r.URL.Query().Get("ticket"), auth)
+	// A ticket is a bearer secret in the URL: never cache the response and
+	// never leak the URL through Referer.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	authority := canonicalAuthority(g.effectiveHost(r))
+	rec, err := g.consumeTicket(r.URL.Query().Get("ticket"), authority)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
-	value, err := g.signSession(rec.User, auth)
+	value, err := g.signSession(rec.User, authority)
 	if err != nil {
+		if errors.Is(err, errUserUnavailable) {
+			http.Error(w, "unknown user", http.StatusUnauthorized)
+			return
+		}
 		http.Error(w, "session error", http.StatusInternalServerError)
 		return
 	}
@@ -239,18 +293,28 @@ func (g *Gateway) handleLaunchTicket(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   g.cfg.Routing.PublicScheme == "https",
+		Secure:   g.requestScheme(r) == "https",
 		MaxAge:   int(g.cfg.SessionTTL().Seconds()),
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
+
+// errUserUnavailable means the cookie/ticket names an account that was deleted
+// (tombstoned) or disappeared. It maps to 401, not 500.
+var errUserUnavailable = errors.New("user is unavailable")
 
 func (g *Gateway) signSession(user, authority string) (string, error) {
 	p := sessionPayload{User: user, Authority: authority, Exp: time.Now().Add(g.cfg.SessionTTL()).Unix()}
 	if g.loginEnabled() {
 		u, err := auth.Load(g.cfg.Auth.UsersDir, user)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return "", errUserUnavailable
+			}
 			return "", err
+		}
+		if !u.Active() {
+			return "", errUserUnavailable
 		}
 		p.Version = u.Auth.SessionVersion
 	}
@@ -289,7 +353,7 @@ func (g *Gateway) verifySession(value, authority string) (string, bool) {
 	}
 	if g.loginEnabled() {
 		u, err := auth.Load(g.cfg.Auth.UsersDir, p.User)
-		if err != nil || u.Auth.SessionVersion != p.Version {
+		if err != nil || !u.Active() || u.Auth.SessionVersion != p.Version {
 			return "", false
 		}
 	}
@@ -346,10 +410,25 @@ func (g *Gateway) handleStop(w http.ResponseWriter, r *http.Request) {
 		body.Distribution = g.cfg.Runtime.DefaultDistribution
 	}
 	if err := g.mgr.Stop(r.Context(), body.UserID, body.Distribution); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, err.Error(), stopErrorStatus(err))
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// stopErrorStatus maps a lifecycle error to its HTTP status. Busy is not part
+// of Stop's contract (a Stopping record is stopped, not rejected).
+func stopErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, instance.ErrUnknownInstance):
+		return http.StatusNotFound
+	case errors.Is(err, instance.ErrInvalidRequest):
+		return http.StatusBadRequest
+	case errors.Is(err, instance.ErrUnknownUser):
+		return http.StatusUnauthorized
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func (g *Gateway) authorized(r *http.Request) bool {
@@ -365,7 +444,8 @@ func (g *Gateway) authorized(r *http.Request) bool {
 }
 
 func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
-	inst, err := g.mgr.ByHost(r.Host)
+	host := g.effectiveHost(r)
+	inst, err := g.mgr.ByHost(host)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -381,14 +461,22 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	g.serveResolved(w, r, inst)
 }
 
+// errRefreshDshCookie and errFreshDshCookie are the two proxy sentinels: the
+// first asks serveResolved to invalidate the cached cookie and retry once; the
+// second means a freshly exchanged cookie was rejected too (502, no loop).
+var (
+	errRefreshDshCookie = errors.New("dsh cookie needs a refresh")
+	errFreshDshCookie   = errors.New("dsh rejected a fresh cookie")
+)
+
 func (g *Gateway) serveResolved(w http.ResponseWriter, r *http.Request, inst *model.Instance) {
-	auth := canonicalAuthority(r.Host)
+	authority := canonicalAuthority(g.effectiveHost(r))
 	cookie, err := r.Cookie("dw_session")
 	if err != nil {
 		http.Error(w, "missing dw_session", http.StatusUnauthorized)
 		return
 	}
-	user, ok := g.verifySession(cookie.Value, auth)
+	user, ok := g.verifySession(cookie.Value, authority)
 	if !ok {
 		http.Error(w, "invalid dw_session", http.StatusUnauthorized)
 		return
@@ -397,30 +485,54 @@ func (g *Gateway) serveResolved(w http.ResponseWriter, r *http.Request, inst *mo
 		http.NotFound(w, r)
 		return
 	}
-	if inst.State == model.StateStarting {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Retry-After", "3")
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`<!doctype html><html><head><meta charset="utf-8">` +
-			`<meta http-equiv="refresh" content="3">` +
-			`<title>DeepWarper 启动中</title></head><body style="font-family:system-ui">` +
-			`<h2>实例启动中</h2><p>正在等待本机进程就绪。本页每 3 秒自动刷新。</p>` +
-			`<p>状态：` + string(inst.State) + `</p></body></html>`))
+	switch inst.State {
+	case model.StatePending, model.StateStarting, model.StateStopping:
+		writeRetryPage(w, inst.State)
 		return
-	}
-	if inst.State != model.StateRunning {
+	case model.StateRunning:
+	default:
 		http.Error(w, "instance is not running", http.StatusServiceUnavailable)
 		return
 	}
-	dshCookie, err := g.ensureDshCookie(inst)
+
+	dshCookie, cached, err := g.dshCookieFor(inst)
 	if err != nil {
 		http.Error(w, "dsh broker: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	g.mgr.Touch(inst)
 
+	fresh := !cached
+	for attempt := 0; attempt < 2; attempt++ {
+		refresh := false
+		proxy := g.reverseProxy(inst, dshCookie, fresh, &refresh)
+		proxy.ServeHTTP(w, r)
+		if !refresh {
+			return
+		}
+		// dsh rejected a cached cookie (it restarted or rotated its token).
+		// Invalidate, exchange once, and retry exactly once. A second 401 is
+		// turned into a 502 inside reverseProxy.
+		g.invalidateDshCookie(inst)
+		dshCookie, err = g.ensureDshCookie(inst, true)
+		if err != nil {
+			http.Error(w, "dsh broker: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		fresh = true
+	}
+}
+
+// reverseProxy builds the upstream proxy for one attempt. fresh tells the
+// ModifyResponse hook whether the cookie was just exchanged: only a cached
+// cookie may trigger a refresh, so a broken token cannot loop.
+func (g *Gateway) reverseProxy(inst *model.Instance, cookie string, fresh bool, refresh *bool) *httputil.ReverseProxy {
+	scheme := "http"
+	if g.cfg != nil && g.cfg.Routing.PublicScheme != "" {
+		scheme = g.cfg.Routing.PublicScheme
+	}
 	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", inst.Port)}
-	proxy := &httputil.ReverseProxy{
+	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = inst.PublicHost
@@ -428,44 +540,187 @@ func (g *Gateway) serveResolved(w http.ResponseWriter, r *http.Request, inst *mo
 			pr.Out.URL.RawPath = ""
 			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
 			pr.Out.Header.Del("Cookie")
-			pr.Out.Header.Set("Cookie", dshCookie)
-			pr.Out.Header.Set("Origin", g.cfg.Routing.PublicScheme+"://"+inst.PublicHost)
+			pr.Out.Header.Set("Cookie", cookie)
+			pr.Out.Header.Set("Origin", scheme+"://"+inst.PublicHost)
 			pr.Out.Header.Set("X-Forwarded-Host", inst.PublicHost)
-			pr.Out.Header.Set("X-Forwarded-Proto", g.cfg.Routing.PublicScheme)
+			pr.Out.Header.Set("X-Forwarded-Proto", scheme)
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// Never forward dsh Set-Cookie to the browser: the upstream session
+			// cookie is the gateway secret. TestProxyStripsUpstreamSetCookie
+			// pins this.
 			resp.Header.Del("Set-Cookie")
 			if loc := resp.Header.Get("Location"); strings.HasPrefix(loc, "http://127.0.0.1:") {
 				if u, err := url.Parse(loc); err == nil {
 					u.Host = inst.PublicHost
-					u.Scheme = g.cfg.Routing.PublicScheme
+					u.Scheme = scheme
 					resp.Header.Set("Location", u.String())
+				}
+			}
+			if resp.StatusCode == http.StatusUnauthorized {
+				if fresh {
+					return errFreshDshCookie
+				}
+				// Only a request without a body can be replayed. A cached 401 on
+				// POST/PUT/PATCH/DELETE has already consumed its body, so it is
+				// forwarded as-is instead of retried.
+				if idempotentRequest(resp) {
+					*refresh = true
+					return errRefreshDshCookie
 				}
 			}
 			return nil
 		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			g.logger.Printf("proxy %s: %v", inst.ID, err)
-			http.Error(w, "upstream error", http.StatusBadGateway)
+		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, perr error) {
+			switch {
+			case errors.Is(perr, errRefreshDshCookie):
+				// Swallowed: serveResolved retries with a fresh cookie.
+				return
+			case errors.Is(perr, errFreshDshCookie):
+				g.logf("proxy %s: dsh rejected a freshly exchanged cookie", inst.ID)
+				http.Error(rw, "upstream error", http.StatusBadGateway)
+			default:
+				g.logf("proxy %s: %v", inst.ID, perr)
+				http.Error(rw, "upstream error", http.StatusBadGateway)
+			}
 		},
 		FlushInterval: 100 * time.Millisecond,
 	}
-	proxy.ServeHTTP(w, r)
 }
 
-func (g *Gateway) ensureDshCookie(inst *model.Instance) (string, error) {
-	path := filepath.Join(g.cfg.Server.DataDir, "runtime", inst.ID, "dsh-session.json")
-	if data, err := os.ReadFile(path); err == nil {
-		var v struct {
-			Cookie string `json:"cookie"`
-		}
-		if json.Unmarshal(data, &v) == nil && v.Cookie != "" {
-			return v.Cookie, nil
+func (g *Gateway) logf(format string, args ...any) {
+	if g != nil && g.logger != nil {
+		g.logger.Printf(format, args...)
+	}
+}
+
+func writeRetryPage(w http.ResponseWriter, state model.State) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Retry-After", "3")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(`<!doctype html><html><head><meta charset="utf-8">` +
+		`<meta http-equiv="refresh" content="3">` +
+		`<title>DeepWarper 启动中</title></head><body style="font-family:system-ui">` +
+		`<h2>实例启动中</h2><p>正在等待本机进程就绪。本页每 3 秒自动刷新。</p>` +
+		`<p>状态：` + html.EscapeString(string(state)) + `</p></body></html>`))
+}
+
+// dshCookieCacheVersion guards the broker cache format. Version 0 (the old
+// {"cookie": "..."} file) is ignored and re-exchanged.
+const dshCookieCacheVersion = 1
+
+type dshCookieCache struct {
+	Version     int       `json:"version"`
+	InstanceID  string    `json:"instanceId"`
+	Incarnation string    `json:"incarnation"`
+	PublicHost  string    `json:"publicHost"`
+	Cookie      string    `json:"cookie"`
+	FetchedAt   time.Time `json:"fetchedAt"`
+}
+
+func (g *Gateway) dshCookiePath(inst *model.Instance) (string, error) {
+	if inst == nil || !model.IsSafeFileComponent(inst.ID) {
+		return "", errors.New("unsafe instance id")
+	}
+	if g == nil || g.cfg == nil {
+		return "", errors.New("gateway is not configured")
+	}
+	return filepath.Join(g.cfg.Server.DataDir, "runtime", inst.ID, "dsh-session.json"), nil
+}
+
+// readDshCookie returns a cached cookie only when the record, incarnation and
+// public host all match. Anything else is stale.
+func (g *Gateway) readDshCookie(inst *model.Instance) (string, bool) {
+	path, err := g.dshCookiePath(inst)
+	if err != nil {
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var c dshCookieCache
+	if err := json.Unmarshal(data, &c); err != nil {
+		return "", false
+	}
+	if c.Version != dshCookieCacheVersion || c.Cookie == "" {
+		return "", false
+	}
+	if c.InstanceID != inst.ID || c.Incarnation != inst.Incarnation || c.PublicHost != inst.PublicHost {
+		return "", false
+	}
+	return c.Cookie, true
+}
+
+func (g *Gateway) writeDshCookie(inst *model.Instance, cookie string) error {
+	path, err := g.dshCookiePath(inst)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(dshCookieCache{
+		Version:     dshCookieCacheVersion,
+		InstanceID:  inst.ID,
+		Incarnation: inst.Incarnation,
+		PublicHost:  inst.PublicHost,
+		Cookie:      cookie,
+		FetchedAt:   time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Dir(path), path, data, 0o600)
+}
+
+func (g *Gateway) invalidateDshCookie(inst *model.Instance) {
+	if path, err := g.dshCookiePath(inst); err == nil {
+		_ = os.Remove(path)
+	}
+}
+
+// dshCookieFor returns the cached cookie and whether it was cached, or
+// exchanges a token when no valid cache exists.
+func (g *Gateway) dshCookieFor(inst *model.Instance) (string, bool, error) {
+	if cookie, ok := g.readDshCookie(inst); ok {
+		return cookie, true, nil
+	}
+	cookie, err := g.ensureDshCookie(inst, false)
+	return cookie, false, err
+}
+
+// dshLock serializes token exchanges per instance so concurrent first requests
+// do not race each other into two dsh sessions.
+func (g *Gateway) dshLock(id string) func() {
+	g.dshMu.Lock()
+	if g.dshLocks == nil {
+		g.dshLocks = map[string]*sync.Mutex{}
+	}
+	m := g.dshLocks[id]
+	if m == nil {
+		m = &sync.Mutex{}
+		g.dshLocks[id] = m
+	}
+	g.dshMu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
+func (g *Gateway) ensureDshCookie(inst *model.Instance, force bool) (string, error) {
+	if inst == nil {
+		return "", errors.New("instance is required")
+	}
+	unlock := g.dshLock(inst.ID)
+	defer unlock()
+	if !force {
+		if cookie, ok := g.readDshCookie(inst); ok {
+			return cookie, nil
 		}
 	}
 	token, err := g.mgr.Token(inst)
 	if err != nil {
 		return "", fmt.Errorf("read token: %w", err)
+	}
+	if token == "" {
+		return "", errors.New("empty dsh token")
 	}
 	u := fmt.Sprintf("http://127.0.0.1:%d/?token=%s", inst.Port, url.QueryEscape(token))
 	req, err := http.NewRequest(http.MethodGet, u, nil)
@@ -489,20 +744,46 @@ func (g *Gateway) ensureDshCookie(inst *model.Instance) (string, error) {
 	if cookie == "" {
 		return "", fmt.Errorf("token exchange returned %d without dsh-auth cookie", resp.StatusCode)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", err
-	}
-	data, _ := json.Marshal(map[string]string{"cookie": cookie})
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := g.writeDshCookie(inst, cookie); err != nil {
 		return "", err
 	}
 	return cookie, nil
 }
 
+// canonicalAuthority is the host:port string a session/ticket is bound to. It
+// is built from the effective (allowlisted) host, so a session cookie minted
+// for one subdomain never verifies on another. A default port (80/443) is
+// normalized away so `host` and `host:443` are the same authority.
 func canonicalAuthority(host string) string {
-	h := strings.TrimSuffix(strings.ToLower(host), ".")
-	if hostOnly, port, err := net.SplitHostPort(h); err == nil {
-		return hostOnly + ":" + port
+	host = normalizeHost(host)
+	if host == "" {
+		return ""
 	}
-	return h
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port == "80" || port == "443" {
+			return h
+		}
+		return net.JoinHostPort(h, port)
+	}
+	return host
+}
+
+// idempotentRequest reports whether replaying the upstream request is safe.
+// The method must be idempotent and the request must be bodyless: a GET, HEAD
+// or OPTIONS carrying a body has already had that body consumed by the failed
+// attempt, so retrying it would send an empty body upstream.
+func idempotentRequest(resp *http.Response) bool {
+	if resp == nil || resp.Request == nil {
+		return true
+	}
+	req := resp.Request
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+	default:
+		return false
+	}
+	if req.Body != nil && req.Body != http.NoBody && req.ContentLength != 0 {
+		return false
+	}
+	return true
 }

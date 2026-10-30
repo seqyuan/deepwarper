@@ -43,7 +43,10 @@ type Spec struct {
 	Port         int    `json:"port"`
 	PatchPath    string `json:"patch_path,omitempty"`
 	PatchContent string `json:"patch_content,omitempty"`
-	Heartbeat    string `json:"heartbeat,omitempty"`
+	// ExtraPatches are additional dsh --patch files applied after the
+	// runtime patch. User plugin rows live in <home>/user-cordis.patch.yml.
+	ExtraPatches []string `json:"extra_patches,omitempty"`
+	Heartbeat    string   `json:"heartbeat,omitempty"`
 	// ReadyTimeout replaces the old hardcoded 90s wait for dsh's ready line.
 	ReadyTimeout string `json:"ready_timeout,omitempty"`
 	CPU          int    `json:"cpu,omitempty"`
@@ -70,13 +73,28 @@ type RcloneSpec struct {
 
 const (
 	ExitOK                = 0
+	ExitSpecInvalid       = 2
 	ExitHomeLocked        = 3
 	ExitDshMissing        = 4
 	ExitExitedBeforeReady = 5
 	ExitReadyTimeout      = 6
 	ExitNoToken           = 7
 	ExitControlDir        = 8
+	ExitDshStartFailed    = 9
 )
+
+// publishFailure records an early exit for the control plane. It is best
+// effort: a launch that failed before the control directory exists cannot
+// report anything, and a reporting error must not mask the real cause.
+func publishFailure(controlDir, incarnation string, code int, reason string) {
+	if controlDir == "" {
+		return
+	}
+	_ = rendezvous.WriteString(controlDir, "incarnation", incarnation, 0o644)
+	_ = rendezvous.WriteString(controlDir, "state", "failed", 0o644)
+	_ = rendezvous.WriteString(controlDir, "exit_code", strconv.Itoa(code), 0o644)
+	_ = rendezvous.WriteString(controlDir, "message", reason, 0o644)
+}
 
 func Run(ctx context.Context, specPath string) int {
 	data, err := os.ReadFile(specPath)
@@ -91,7 +109,8 @@ func Run(ctx context.Context, specPath string) int {
 	}
 	if spec.ControlDir == "" || spec.Home == "" || spec.Workspace == "" {
 		fmt.Fprintln(os.Stderr, "spec is missing control_dir/home/workspace")
-		return ExitControlDir
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitSpecInvalid, "spec is missing control_dir/home/workspace")
+		return ExitSpecInvalid
 	}
 	// Port 0 means this process picks a free loopback port and publishes it
 	// in ready.json.
@@ -99,35 +118,39 @@ func Run(ctx context.Context, specPath string) int {
 		port, err := freeLoopbackPort()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "pick a loopback port: %v\n", err)
-			_ = rendezvous.WriteString(spec.ControlDir, "state", "failed", 0o644)
-			_ = rendezvous.WriteString(spec.ControlDir, "exit_code", fmt.Sprint(ExitControlDir), 0o644)
+			publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "pick a loopback port: "+err.Error())
 			return ExitControlDir
 		}
 		spec.Port = port
 	}
 	if err := os.MkdirAll(spec.ControlDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "control dir: %v\n", err)
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "control dir: "+err.Error())
 		return ExitControlDir
 	}
 	if spec.PatchContent != "" {
 		spec.PatchPath = filepath.Join(spec.ControlDir, "runtime.patch.yml")
 		if err := os.WriteFile(spec.PatchPath, []byte(spec.PatchContent), 0o600); err != nil {
 			fmt.Fprintf(os.Stderr, "write runtime patch: %v\n", err)
+			publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "write runtime patch: "+err.Error())
 			return ExitControlDir
 		}
 	}
 	if err := os.MkdirAll(spec.Home, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "home: %v\n", err)
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "home: "+err.Error())
 		return ExitControlDir
 	}
 	if err := os.MkdirAll(spec.Workspace, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "workspace: %v\n", err)
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "workspace: "+err.Error())
 		return ExitControlDir
 	}
 
 	lock, err := state.Acquire(filepath.Join(spec.Home, ".dw.lock"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "home lock: %v\n", err)
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitHomeLocked, "home lock: "+err.Error())
 		return ExitHomeLocked
 	}
 	defer lock.Release()
@@ -145,7 +168,7 @@ func Run(ctx context.Context, specPath string) int {
 	logFile, err := os.OpenFile(spec.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "log file: %v\n", err)
-		pub("state", "failed")
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "log file: "+err.Error())
 		return ExitControlDir
 	}
 	defer logFile.Close()
@@ -153,34 +176,33 @@ func Run(ctx context.Context, specPath string) int {
 
 	if _, err := exec.LookPath(spec.DshBin); err != nil {
 		fmt.Fprintf(logger, "dsh binary not found: %v\n", err)
-		pub("state", "failed")
-		pub("exit_code", fmt.Sprint(ExitDshMissing))
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitDshMissing, "dsh binary not found: "+err.Error())
 		return ExitDshMissing
 	}
 
 	argv, err := prefixCommand(spec, exec.LookPath)
 	if err != nil {
 		fmt.Fprintf(logger, "%v\n", err)
-		pub("state", "failed")
-		return 1
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitDshStartFailed, err.Error())
+		return ExitDshStartFailed
 	}
 	// Clear already removed anything attachSandbox wrote. Rewrite the wrapper
 	// from the spec immediately before bwrap starts.
 	if err := writeWrapper(spec); err != nil {
 		fmt.Fprintf(logger, "%v\n", err)
-		pub("state", "failed")
-		return 1
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitDshStartFailed, err.Error())
+		return ExitDshStartFailed
 	}
 	var fuseMounts []string
 	if len(spec.Rclone) > 0 {
 		var err error
-		fuseMounts, err = startHostRclone(spec)
+		fuseMounts, err = startHostRclone(spec, logger)
 		if err != nil {
 			fmt.Fprintf(logger, "%v\n", err)
-			pub("state", "failed")
-			return 1
+			publishFailure(spec.ControlDir, spec.Incarnation, ExitDshStartFailed, err.Error())
+			return ExitDshStartFailed
 		}
-		defer stopHostRclone(fuseMounts)
+		defer stopHostRclone(fuseMounts, logger)
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = spec.Workspace
@@ -197,20 +219,19 @@ func Run(ctx context.Context, specPath string) int {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		fmt.Fprintf(logger, "stdout pipe: %v\n", err)
-		pub("state", "failed")
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "stdout pipe: "+err.Error())
 		return ExitControlDir
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		fmt.Fprintf(logger, "stderr pipe: %v\n", err)
-		pub("state", "failed")
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "stderr pipe: "+err.Error())
 		return ExitControlDir
 	}
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(logger, "start dsh: %v\n", err)
-		pub("state", "failed")
-		pub("exit_code", fmt.Sprint(ExitDshMissing))
-		return ExitDshMissing
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitDshStartFailed, "start dsh: "+err.Error())
+		return ExitDshStartFailed
 	}
 
 	readyCh := make(chan string, 1)
@@ -290,7 +311,7 @@ func Run(ctx context.Context, specPath string) int {
 	if err := rendezvous.WriteString(spec.ControlDir, "token", token, 0o600); err != nil {
 		fmt.Fprintf(logger, "write token: %v\n", err)
 		killGroup(cmd)
-		pub("state", "failed")
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "write token: "+err.Error())
 		return ExitControlDir
 	}
 	r := rendezvous.Ready{
@@ -309,7 +330,7 @@ func Run(ctx context.Context, specPath string) int {
 	if err := rendezvous.WriteReady(spec.ControlDir, r); err != nil {
 		fmt.Fprintf(logger, "write ready: %v\n", err)
 		killGroup(cmd)
-		pub("state", "failed")
+		publishFailure(spec.ControlDir, spec.Incarnation, ExitControlDir, "write ready: "+err.Error())
 		return ExitControlDir
 	}
 	pub("state", "ready")
@@ -388,11 +409,11 @@ func readMountinfo() (string, error) {
 	return string(data), nil
 }
 
-func startHostRclone(spec Spec) ([]string, error) {
+func startHostRclone(spec Spec, log *redactingWriter) ([]string, error) {
 	var points []string
 	var cmds []*exec.Cmd
 	fail := func(err error) ([]string, error) {
-		stopHostRclone(points)
+		stopHostRclone(points, log)
 		for _, cmd := range cmds {
 			if cmd.Process != nil {
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -402,6 +423,12 @@ func startHostRclone(spec Spec) ([]string, error) {
 		return nil, err
 	}
 	for _, rc := range spec.Rclone {
+		// Clear a stale fuse mount before touching the mountpoint: on a dead
+		// FUSE mount, stat/MkdirAll itself returns ENOTCONN or a spurious
+		// EEXIST, so the old order could never reach the unmount.
+		if err := unmountStale(rc.MountPoint); err != nil {
+			return fail(err)
+		}
 		if err := os.MkdirAll(rc.MountPoint, 0o700); err != nil {
 			return fail(err)
 		}
@@ -423,10 +450,81 @@ func startHostRclone(spec Spec) ([]string, error) {
 	return points, nil
 }
 
-func stopHostRclone(points []string) {
+// unmountTimeout bounds every fusermount/umount invocation so a wedged fuse
+// daemon cannot hang the agent's exit path.
+const unmountTimeout = 10 * time.Second
+
+// unmountStale clears a fuse mount left behind by an earlier incarnation. It
+// fails closed: if the path is still a fuse mount after all attempts the launch
+// must not proceed, because rclone cannot mount over it.
+func unmountStale(path string) error {
+	if !fuseMounted(path) {
+		return nil
+	}
+	var lastErr error
+	// A killed rclone leaves a mount whose disconnect can take a moment to
+	// settle. Retry the sequence; each helper may still see a stale mtab entry
+	// on the first pass even though the lazy/legacy fallback later succeeds.
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := unmountPath(path); err != nil {
+			lastErr = err
+		}
+		if !fuseMounted(path) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("unmount stale rclone mount %s: %w", path, lastErr)
+	}
+	return fmt.Errorf("rclone mount %s is still mounted after unmount attempts", path)
+}
+
+// unmountPath tries the normal and lazy fusermount paths, then the legacy
+// fusermount, then a lazy umount. A command may report an error while the mount
+// is already gone (or vice versa), so success is decided by mountinfo.
+func unmountPath(path string) error {
+	if !fuseMounted(path) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), unmountTimeout)
+	defer cancel()
+	var failures []string
+	for _, argv := range [][]string{
+		{"fusermount3", "-u", path},
+		{"fusermount3", "-uz", path},
+		{"fusermount", "-u", path},
+		{"fusermount", "-uz", path},
+		{"umount", "-l", path},
+	} {
+		out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
+		if !fuseMounted(path) {
+			return nil
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v %s", argv[0], err, strings.TrimSpace(string(out))))
+		} else {
+			failures = append(failures, argv[0]+": still mounted")
+		}
+	}
+	return errors.New(strings.Join(failures, "; "))
+}
+
+func fuseMounted(path string) bool {
+	info, err := readMountinfo()
+	if err != nil {
+		return false
+	}
+	return mount.FuseReady(info, path)
+}
+
+func stopHostRclone(points []string, log *redactingWriter) {
 	for _, p := range points {
-		_ = exec.Command("fusermount", "-u", p).Run()
-		_ = exec.Command("umount", p).Run()
+		if err := unmountStale(p); err != nil {
+			if log != nil {
+				fmt.Fprintf(log, "unmount %s: %v\n", p, err)
+			}
+		}
 	}
 }
 
@@ -451,13 +549,24 @@ func writeWrapper(spec Spec) error {
 func dshArgv(spec Spec) []string {
 	args := []string{spec.DshBin, "--profile", spec.Profile}
 	patch := spec.PatchPath
-	if len(spec.BwrapArgv) > 0 && patch != "" {
+	sandboxed := len(spec.BwrapArgv) > 0
+	if sandboxed && patch != "" {
 		// The control directory is bind-mounted at /dw/control.
 		patch = "/dw/control/" + filepath.Base(patch)
 	}
 	if patch != "" {
 		// --patch is a launcher option; it must precede app args.
 		args = append(args, "--patch", patch)
+	}
+	for _, extra := range spec.ExtraPatches {
+		if extra == "" {
+			continue
+		}
+		p := extra
+		if sandboxed {
+			p = sandboxPatchPath(spec.Home, extra)
+		}
+		args = append(args, "--patch", p)
 	}
 	args = append(args,
 		"--no-open",
@@ -467,6 +576,25 @@ func dshArgv(spec Spec) []string {
 		"--trusted-host", spec.TrustedHost,
 	)
 	return args
+}
+
+// sandboxPatchPath maps a host path under the instance home to the path
+// dsh sees after home is bind-mounted at /home/dsh. Other paths keep their
+// host location because mount.Build also binds the home directory there.
+func sandboxPatchPath(home, hostPath string) string {
+	home = filepath.Clean(home)
+	hostPath = filepath.Clean(hostPath)
+	if home == "" || home == "." {
+		return hostPath
+	}
+	if hostPath == home {
+		return "/home/dsh"
+	}
+	prefix := home + string(filepath.Separator)
+	if strings.HasPrefix(hostPath, prefix) {
+		return filepath.Join("/home/dsh", strings.TrimPrefix(hostPath, prefix))
+	}
+	return hostPath
 }
 
 // prefixCommand returns the dsh argv, or that argv inside bwrap when the

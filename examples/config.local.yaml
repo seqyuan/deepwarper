@@ -4,16 +4,35 @@
 server:
   listen: 127.0.0.1:7658
   dataDir: /tmp/dw-prod
+  # Extra directories a platform launch may request as a workspace. The
+  # implicit root is <dataDir>/workspaces/<slug>; relative paths here are
+  # resolved next to this file.
+  # workspaceRoots:
+  #   - /srv/dw-workspaces
 
 routing:
   mode: host
   hostSuffix: localhost
   publicScheme: http
+  # Port users actually see. 0 (default) derives it from server.listen.
+  # Behind a 443 reverse proxy set publicScheme: https and publicPort: 443 so
+  # instance URLs are https://alice.example.com/ (no :7658).
+  # publicPort: 443
+  # Honor X-Forwarded-Host/-Proto/-Port/-For from the fronting proxy. Only
+  # enable when `dw serve` itself is not reachable from browsers.
+  # trustProxyHeaders: true
 
 platform:
   token: poc-token
   ticketTTL: 60s
   sessionTTL: 12h
+
+# Login mode is enabled when usersDir is set (`dw serve` then serves /login).
+# auth:
+#   usersDir: /tmp/dw-prod/users
+#   loginMaxAttempts: 10
+#   loginWindow: 5m
+#   loginLockout: 5m
 
 runtime:
   default: local

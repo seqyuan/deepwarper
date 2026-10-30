@@ -38,6 +38,7 @@ func TestUnitArgvGolden(t *testing.T) {
 		"-p", "MemorySwapMax=0",
 		"-p", "TasksMax=512",
 		"-p", "KillMode=control-group",
+		"-p", "SuccessExitStatus=143",
 		"-p", "TimeoutStopSec=20",
 		"-p", "WorkingDirectory=/tmp/dw-prod/workspaces/alice",
 		"-p", "StandardOutput=append:/tmp/dw-prod/logs/alice-default.log",

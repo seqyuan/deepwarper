@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/seqyuan/deepwarper/internal/gateway"
 	"github.com/seqyuan/deepwarper/internal/instance"
 	"github.com/seqyuan/deepwarper/internal/runtime/local"
+	"github.com/seqyuan/deepwarper/internal/state"
 )
 
 var version = "dev"
@@ -84,6 +86,16 @@ func serve(args []string) {
 		log.Fatal(err)
 	}
 	logger := log.New(os.Stdout, "[dw] ", log.LstdFlags)
+	// A single control plane per data directory: two `dw serve` processes would
+	// interleave writes to the same records and ports.
+	dataLock, err := state.LockDataDir(cfg.Server.DataDir)
+	if err != nil {
+		if errors.Is(err, state.ErrLocked) {
+			log.Fatalf("data directory %s is already in use by another dw serve (%s)", cfg.Server.DataDir, filepath.Join(cfg.Server.DataDir, "locks", "serve.lock"))
+		}
+		log.Fatalf("lock data directory %s: %v", cfg.Server.DataDir, err)
+	}
+	defer dataLock.Release()
 	mgr, err := instance.New(cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -104,9 +116,13 @@ func serve(args []string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	fastEvery := cfg.ScanInterval()
+	// Consumed/expired tickets must not accumulate: random /_dw/launch
+	// requests and normal one-time use both leave files behind.
+	go gw.RunTicketJanitor(ctx, time.Minute)
+	// One scan loop, not two: Reconcile must finish before Sweep sees the same
+	// record, otherwise an idle sweep can stop an instance mid-adoption.
 	go func() {
-		ticker := time.NewTicker(fastEvery)
+		ticker := time.NewTicker(cfg.ScanInterval())
 		defer ticker.Stop()
 		for {
 			select {
@@ -116,17 +132,6 @@ func serve(args []string) {
 				if err := mgr.Reconcile(ctx); err != nil {
 					logger.Printf("reconcile: %v", err)
 				}
-			}
-		}
-	}()
-	go func() {
-		ticker := time.NewTicker(cfg.ScanInterval())
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
 				if err := mgr.Sweep(ctx); err != nil {
 					logger.Printf("sweep: %v", err)
 				}

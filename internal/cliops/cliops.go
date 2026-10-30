@@ -12,6 +12,7 @@ import (
 	"github.com/seqyuan/deepwarper/internal/model"
 	"github.com/seqyuan/deepwarper/internal/mount"
 	"github.com/seqyuan/deepwarper/internal/plugin"
+	"github.com/seqyuan/deepwarper/internal/state"
 )
 
 func usersDir(configDir string) string {
@@ -28,7 +29,9 @@ func UserSetPassword(configDir, name, password string) error {
 	return auth.SetPassword(usersDir(configDir), name, password)
 }
 
-// UserDelete removes the user file.
+// UserDelete tombstones the account: credentials, mounts and plugins are
+// cleared and the session generation advances, so recreating the same name
+// cannot revive sessions issued before the delete.
 func UserDelete(configDir, name string) error {
 	return auth.Delete(usersDir(configDir), name)
 }
@@ -196,8 +199,34 @@ func DataDirFromServeConfig(path string) (string, error) {
 	return dir, nil
 }
 
+// instanceHome is the home the instance manager uses for user. An existing
+// record wins (it may carry a reused or stable-slug home); otherwise the
+// manager's default LocalSlug home is used so plugin edits land in the same
+// tree a later launch reads.
 func instanceHome(dataDir, user string) string {
-	return filepath.Join(dataDir, "homes", model.Slugify(user))
+	if strings.TrimSpace(dataDir) != "" {
+		if store, err := state.New(dataDir); err == nil {
+			if list, err := store.List(); err == nil {
+				var running *model.Instance
+				for _, inst := range list {
+					if inst.User != user || inst.Home == "" {
+						continue
+					}
+					if inst.State == model.StateRunning {
+						running = inst
+						break
+					}
+					if running == nil {
+						running = inst
+					}
+				}
+				if running != nil {
+					return running.Home
+				}
+			}
+		}
+	}
+	return filepath.Join(dataDir, "homes", model.LocalSlug(user))
 }
 
 // PluginEnable turns a catalog plugin on for the user and writes the cordis

@@ -1,13 +1,14 @@
 package gateway
 
 import (
+	"fmt"
 	"html"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/seqyuan/deepwarper/internal/auth"
 	"github.com/seqyuan/deepwarper/internal/model"
@@ -23,7 +24,7 @@ func (g *Gateway) currentUser(r *http.Request) (string, bool) {
 	if err != nil || c.Value == "" {
 		return "", false
 	}
-	return g.verifySession(c.Value, canonicalAuthority(r.Host))
+	return g.verifySession(c.Value, canonicalAuthority(g.effectiveHost(r)))
 }
 
 func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +45,7 @@ func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
 </form>
 </body></html>`))
 	case http.MethodPost:
-		if !originAllowed(r) {
+		if !g.originAllowed(r) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -55,16 +56,58 @@ func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		name := strings.TrimSpace(r.PostFormValue("username"))
 		password := r.PostFormValue("password")
+
+		// Rate limit both the client IP and the (IP, username) pair so one
+		// address cannot spray accounts and one account cannot be hammered.
+		limiter := g.loginLimit()
+		ipKey := g.clientIP(r)
+		userKey := ipKey + "|" + strings.ToLower(name)
+		if ok, wait := limiter.allow(ipKey); !ok {
+			writeRateLimited(w, wait)
+			return
+		}
+		if ok, wait := limiter.allow(userKey); !ok {
+			writeRateLimited(w, wait)
+			return
+		}
+
 		ok, err := auth.Authenticate(g.cfg.Auth.UsersDir, name, password)
 		if err != nil {
 			http.Error(w, "login error", http.StatusInternalServerError)
 			return
 		}
 		if !ok {
+			limiter.fail(ipKey)
+			limiter.fail(userKey)
+			limiter.prune(time.Now())
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		value, err := g.signSession(name, canonicalAuthority(r.Host))
+		limiter.reset(ipKey)
+		limiter.reset(userKey)
+
+		host := g.effectiveHost(r)
+		// On the apex, a user that already has an instance record is sent to
+		// its subdomain with a one-time ticket instead of receiving an apex
+		// host-only cookie that cannot be used on the instance host.
+		if g.isApex(host) && g.mgr != nil {
+			inst, ierr := g.mgr.ByUser(name)
+			if ierr != nil {
+				http.Error(w, "login error", http.StatusInternalServerError)
+				return
+			}
+			if inst != nil {
+				ticket, terr := g.issueTicket(inst)
+				if terr != nil {
+					http.Error(w, "session error", http.StatusInternalServerError)
+					return
+				}
+				target := fmt.Sprintf("%s://%s/_dw/launch?ticket=%s", g.requestScheme(r), inst.PublicHost, url.QueryEscape(ticket))
+				http.Redirect(w, r, target, http.StatusSeeOther)
+				return
+			}
+		}
+		value, err := g.signSession(name, canonicalAuthority(host))
 		if err != nil {
 			http.Error(w, "session error", http.StatusInternalServerError)
 			return
@@ -75,45 +118,13 @@ func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
 			Path:     "/",
 			HttpOnly: true,
 			SameSite: http.SameSiteLaxMode,
-			Secure:   g.cfg.Routing.PublicScheme == "https",
+			Secure:   g.requestScheme(r) == "https",
 			MaxAge:   int(g.cfg.SessionTTL().Seconds()),
 		})
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-func originAllowed(r *http.Request) bool {
-	raw := strings.TrimSpace(r.Header.Get("Origin"))
-	if raw == "" {
-		return true
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return false
-	}
-	oHost, oPort := splitHost(u.Host)
-	if oPort == "" {
-		if u.Scheme == "https" {
-			oPort = "443"
-		} else {
-			oPort = "80"
-		}
-	}
-	rHost, rPort := splitHost(r.Host)
-	if rPort == "" {
-		rPort = "80"
-	}
-	return strings.EqualFold(oHost, rHost) && oPort == rPort
-}
-
-func splitHost(hostport string) (string, string) {
-	h, p, err := net.SplitHostPort(hostport)
-	if err != nil {
-		return hostport, ""
-	}
-	return h, p
 }
 
 func (g *Gateway) handleUserHome(w http.ResponseWriter, r *http.Request) {
@@ -157,7 +168,7 @@ func (g *Gateway) handlePlugins(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec, err := auth.Load(g.cfg.Auth.UsersDir, user)
-	if err != nil {
+	if err != nil || !rec.Active() {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -206,7 +217,7 @@ func (g *Gateway) handleMounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec, err := auth.Load(g.cfg.Auth.UsersDir, user)
-	if err != nil {
+	if err != nil || !rec.Active() {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

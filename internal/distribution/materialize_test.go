@@ -39,4 +39,14 @@ func TestMaterializeIsNonDestructive(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, "sessions")); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(filepath.Join(home, "plugins")); err != nil {
+		t.Fatal(err)
+	}
+	userPatch, err := os.ReadFile(filepath.Join(home, "user-cordis.patch.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(userPatch) != "[]\n" {
+		t.Fatalf("user patch seed: %q", userPatch)
+	}
 }

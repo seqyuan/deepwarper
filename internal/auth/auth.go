@@ -29,9 +29,20 @@ type User struct {
 	Auth struct {
 		PasswordHash   string `yaml:"password_hash"`
 		SessionVersion int    `yaml:"session_version"`
+		// Deleted tombstones an account instead of removing the file, so the
+		// advanced SessionVersion survives a delete/recreate cycle and old
+		// dw_session cookies stay invalid.
+		Deleted bool `yaml:"deleted,omitempty"`
 	} `yaml:"auth"`
 	Mounts  []Mount  `yaml:"mounts"`
 	Plugins []string `yaml:"plugins"`
+}
+
+// Active reports whether the account may log in and use its instance. A
+// tombstoned account keeps its file (and generation) but no credentials, and a
+// record without a password hash is not a usable account either.
+func (u *User) Active() bool {
+	return u != nil && !u.Auth.Deleted && u.Auth.PasswordHash != ""
 }
 
 var usernameRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
@@ -69,10 +80,26 @@ func Create(dir, name, password string) error {
 		return err
 	}
 	path := filepath.Join(dir, name+".yaml")
-	if _, err := os.Stat(path); err == nil {
+	if existing, lerr := Load(dir, name); lerr == nil {
+		if existing.Auth.Deleted {
+			// Recreate over a tombstone: the generation keeps advancing so
+			// sessions issued before the delete never come back to life.
+			hash, herr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			if herr != nil {
+				return herr
+			}
+			existing.Auth.PasswordHash = string(hash)
+			existing.Auth.Deleted = false
+			existing.Mounts = []Mount{}
+			existing.Plugins = []string{}
+			if existing.Auth.SessionVersion < 2 {
+				existing.Auth.SessionVersion = 2
+			}
+			return Save(dir, existing)
+		}
 		return fmt.Errorf("auth: user %q already exists", name)
-	} else if !os.IsNotExist(err) {
-		return err
+	} else if !os.IsNotExist(lerr) {
+		return lerr
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -112,6 +139,9 @@ func SetPassword(dir, name, password string) error {
 	if err != nil {
 		return err
 	}
+	if !u.Active() {
+		return fmt.Errorf("auth: user %q not found", name)
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return err
@@ -124,19 +154,32 @@ func SetPassword(dir, name, password string) error {
 	return Save(dir, u)
 }
 
-// Delete removes the user file.
+// Delete tombstones the user record: the file stays (with an advanced
+// SessionVersion and no credentials) so delete+recreate cannot revive an old
+// session or hand the new account the old generation.
 func Delete(dir, name string) error {
 	if !IsValidUsername(name) {
 		return fmt.Errorf("auth: invalid username %q", name)
 	}
-	path := filepath.Join(dir, name+".yaml")
-	if err := os.Remove(path); err != nil {
+	u, err := Load(dir, name)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("auth: user %q not found", name)
 		}
 		return err
 	}
-	return nil
+	if !u.Active() {
+		return fmt.Errorf("auth: user %q not found", name)
+	}
+	u.Auth.SessionVersion++
+	if u.Auth.SessionVersion < 2 {
+		u.Auth.SessionVersion = 2
+	}
+	u.Auth.Deleted = true
+	u.Auth.PasswordHash = ""
+	u.Mounts = []Mount{}
+	u.Plugins = []string{}
+	return Save(dir, u)
 }
 
 // Authenticate reports whether name and password match. An unknown user and
@@ -153,6 +196,12 @@ func Authenticate(dir, name, password string) (bool, error) {
 			return false, nil
 		}
 		return false, err
+	}
+	if !u.Active() || u.Auth.PasswordHash == "" {
+		// Tombstoned or credential-less records still pay the bcrypt cost so
+		// timing does not reveal the account state.
+		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
+		return false, nil
 	}
 	if bcrypt.CompareHashAndPassword([]byte(u.Auth.PasswordHash), []byte(password)) != nil {
 		return false, nil

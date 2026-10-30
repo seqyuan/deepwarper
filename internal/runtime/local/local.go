@@ -159,13 +159,13 @@ func (b *Backend) startUnit(ctx context.Context, spec agent.Spec) (*Handle, erro
 	if err := validateUnitName(unit); err != nil {
 		return nil, err
 	}
-	if err := validateUnitPropertyPath("working directory", spec.Workspace); err != nil {
+	if err := ValidateUnitPath("working directory", spec.Workspace); err != nil {
 		return nil, err
 	}
-	if err := validateUnitPropertyPath("log path", spec.LogPath); err != nil {
+	if err := ValidateUnitPath("log path", spec.LogPath); err != nil {
 		return nil, err
 	}
-	if err := validateUnitPropertyPath("home", spec.Home); err != nil {
+	if err := ValidateUnitPath("home", spec.Home); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(spec.LogPath), 0o700); err != nil {
@@ -292,23 +292,24 @@ func (b *Backend) Probe(ctx context.Context, inst *model.Instance) (runtime.Obse
 }
 
 func (b *Backend) probePID(inst *model.Instance) runtime.Observation {
+	pid, start, ok := recordedPID(inst)
 	obs := runtime.Observation{
 		Source:   "pid",
-		PID:      inst.PID,
-		PIDStart: inst.PIDStart,
+		PID:      pid,
+		PIDStart: start,
 	}
-	if inst.PID <= 0 {
+	if !ok {
 		obs.Phase = runtime.PhaseUnknown
 		obs.Detail = "no pid recorded"
 		return obs
 	}
-	if !processAlive(inst.PID, 0) {
+	if !processAlive(pid, 0) {
 		obs.Phase = runtime.PhaseInactive
 		obs.Detail = "process not found"
 		return obs
 	}
-	if inst.PIDStart > 0 {
-		if pidStartTime(inst.PID) != inst.PIDStart {
+	if start > 0 {
+		if pidStartTime(pid) != start {
 			obs.Phase = runtime.PhaseInactive
 			obs.Detail = "pid was reused"
 			return obs
@@ -316,6 +317,40 @@ func (b *Backend) probePID(inst *model.Instance) runtime.Observation {
 	}
 	obs.Phase = runtime.PhaseActive
 	return obs
+}
+
+// recordedPID resolves the process a record describes. Older control planes
+// did not persist PID/PIDStart, so the agent's control-dir files are read
+// instead. Those files are pinned to the record's incarnation: a leftover pid
+// from an earlier launch must never be probed or signalled for this one.
+func recordedPID(inst *model.Instance) (int, uint64, bool) {
+	if inst == nil {
+		return 0, 0, false
+	}
+	if inst.PID > 0 {
+		return inst.PID, inst.PIDStart, true
+	}
+	if inst.ControlDir == "" {
+		return 0, 0, false
+	}
+	if inc, err := rendezvous.Read(inst.ControlDir, "incarnation"); err == nil && inc != "" && inc != inst.Incarnation {
+		return 0, 0, false
+	}
+	raw, err := rendezvous.Read(inst.ControlDir, "pid")
+	if err != nil {
+		return 0, 0, false
+	}
+	pid, err := strconv.Atoi(raw)
+	if err != nil || pid <= 0 {
+		return 0, 0, false
+	}
+	var start uint64
+	if rawStart, err := rendezvous.Read(inst.ControlDir, "pid_start"); err == nil {
+		if v, perr := strconv.ParseUint(rawStart, 10, 64); perr == nil {
+			start = v
+		}
+	}
+	return pid, start, true
 }
 
 func (b *Backend) probeUnitRaw(ctx context.Context, unit, logPath string) (runtime.Observation, error) {
@@ -366,7 +401,22 @@ func (b *Backend) Stop(ctx context.Context, inst *model.Instance) error {
 	if ref := normalizeUnitName(inst.BackendRef); ref != "" {
 		return b.stopUnit(ctx, ref, b.StopGrace)
 	}
-	return stopRecordedProcess(ctx, inst.PID, inst.PIDStart, specPath(inst.ControlDir))
+	// A pid stop is authoritative: when a pid was found, its result is the
+	// answer even if the process turned out to be already gone.
+	if pid, start, ok := recordedPID(inst); ok {
+		return stopRecordedProcess(ctx, pid, start, specPath(inst.ControlDir))
+	}
+	// No pid was recorded: a Pending unit-mode record can still own a unit
+	// that was never persisted in BackendRef. Only consult systemd when it
+	// exists, so a process-mode stop never fails for a missing systemctl.
+	unit := normalizeUnitName(inst.UnitName)
+	if unit == "" {
+		return nil
+	}
+	if _, err := b.runner().LookPath("systemctl"); err != nil {
+		return nil
+	}
+	return b.stopUnit(ctx, unit, b.StopGrace)
 }
 
 // Handle is the in-process view of a started instance.
@@ -385,8 +435,10 @@ type Handle struct {
 	done        chan struct{}
 	waitErr     error
 
-	stopOnce sync.Once
-	stopErr  error
+	// stopMu serializes Stop calls. Only a confirmed success is remembered:
+	// a failed stop must stay retryable, so the error is never cached.
+	stopMu  sync.Mutex
+	stopped bool
 }
 
 func (h *Handle) Ref() string {
@@ -440,7 +492,16 @@ func (h *Handle) Endpoint(ctx context.Context, timeout time.Duration) (*rendezvo
 		timeout = h.backend.ReadyWait
 	}
 	if h.mode != modeUnit {
-		return rendezvous.WaitReady(ctx, h.controlDir, h.incarnation, timeout)
+		// The agent publishes ready.json only while it is alive. Probing the
+		// child means an agent that exits early fails the launch immediately
+		// instead of burning the full ready timeout.
+		probe := func() (string, bool) {
+			if h.Alive() {
+				return "", false
+			}
+			return fmt.Sprintf("process %d exited before ready", h.PID()), true
+		}
+		return rendezvous.WaitReadyProbe(ctx, h.controlDir, h.incarnation, timeout, probe)
 	}
 	var mu sync.Mutex
 	var last time.Time
@@ -472,13 +533,24 @@ func (h *Handle) Endpoint(ctx context.Context, timeout time.Duration) (*rendezvo
 	return rendezvous.WaitReadyProbe(ctx, h.controlDir, h.incarnation, timeout, probe)
 }
 
+// Stop is idempotent: a confirmed stop is remembered, a failed stop is not.
+// The caller's context is honoured while waiting, but a canceled caller must
+// not make us abandon the kill (see stopChild).
 func (h *Handle) Stop(ctx context.Context) error {
-	h.stopOnce.Do(func() {
-		if h.mode == modeUnit {
-			h.stopErr = h.backend.stopUnit(ctx, h.unit, h.backend.StopGrace)
-			return
-		}
-		h.stopErr = h.stopChild(ctx)
-	})
-	return h.stopErr
+	h.stopMu.Lock()
+	defer h.stopMu.Unlock()
+	if h.stopped {
+		return nil
+	}
+	var err error
+	if h.mode == modeUnit {
+		err = h.backend.stopUnit(ctx, h.unit, h.backend.StopGrace)
+	} else {
+		err = h.stopChild(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	h.stopped = true
+	return nil
 }

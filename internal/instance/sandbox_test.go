@@ -18,7 +18,7 @@ func readyHandle() *fakeHandle {
 	}
 }
 
-func TestEnsureWithoutSandboxLeavesArgvEmpty(t *testing.T) {
+func TestEnsureAlwaysSandboxesDistReadOnly(t *testing.T) {
 	fake := &fakeBackend{handle: readyHandle()}
 	m := newTestManager(t, fake)
 	if _, err := m.Ensure(context.Background(), Request{User: "alice", Distribution: "default"}); err != nil {
@@ -27,8 +27,32 @@ func TestEnsureWithoutSandboxLeavesArgvEmpty(t *testing.T) {
 	if len(fake.starts) != 1 {
 		t.Fatalf("starts: %d", len(fake.starts))
 	}
-	if len(fake.starts[0].BwrapArgv) != 0 || len(fake.starts[0].Rclone) != 0 {
-		t.Fatalf("plain spec was wrapped: %#v", fake.starts[0])
+	spec := fake.starts[0]
+	if len(spec.BwrapArgv) == 0 {
+		t.Fatal("dist must force a sandbox so the base profile stays read-only")
+	}
+	if len(spec.Rclone) != 0 {
+		t.Fatalf("plain dist sandbox should not start rclone: %#v", spec.Rclone)
+	}
+	argv := strings.Join(spec.BwrapArgv, "\n")
+	if !strings.Contains(argv, "--ro-bind") || !strings.Contains(argv, spec.DistPath) {
+		t.Fatalf("dist must be read-only bound: %s", argv)
+	}
+	if !strings.Contains(argv, "/home/dsh") || !strings.Contains(argv, "/workspace") {
+		t.Fatalf("private view missing: %s", argv)
+	}
+	if !strings.Contains(spec.PatchContent, "documentsDirectory: /workspace") {
+		t.Fatalf("sandbox patch must use /workspace: %s", spec.PatchContent)
+	}
+	userPatch := filepath.Join(spec.Home, "user-cordis.patch.yml")
+	found := false
+	for _, p := range spec.ExtraPatches {
+		if p == userPatch {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("user-cordis.patch.yml must be an extra dsh patch: %#v", spec.ExtraPatches)
 	}
 }
 
@@ -85,7 +109,19 @@ func TestEnsureMoniforgePlansBwrapAndInstallsConda(t *testing.T) {
 		}
 	}
 	sep := string(os.PathListSeparator)
-	wantPath := strings.Join([]string{dshDir, "/opt/moniforge/bin", "/opt/dw/env", "/usr/bin", "/bin"}, sep)
+	want := []string{}
+	for _, p := range []string{dshDir, "/opt/moniforge/bin", "/opt/dw/env", "/usr/local/bin", "/usr/bin", "/bin"} {
+		dup := false
+		for _, existing := range want {
+			if existing == p {
+				dup = true
+			}
+		}
+		if !dup {
+			want = append(want, p)
+		}
+	}
+	wantPath := strings.Join(want, sep)
 	if path != wantPath {
 		t.Fatalf("PATH: %q want %q", path, wantPath)
 	}
@@ -98,7 +134,7 @@ func TestEnsureMoniforgePlansBwrapAndInstallsConda(t *testing.T) {
 	}
 }
 
-func TestSandboxBindsEnabledPlugin(t *testing.T) {
+func TestSandboxUsesUserPluginCopy(t *testing.T) {
 	fake := &fakeBackend{handle: readyHandle()}
 	m := newTestManager(t, fake)
 	m.cfg.Runtime.Moniforge = "/opt/moniforge"
@@ -109,6 +145,9 @@ func TestSandboxBindsEnabledPlugin(t *testing.T) {
 	}
 	office := filepath.Join(cfgDir, "office")
 	if err := os.MkdirAll(office, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(office, "index.js"), []byte("catalog\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	catalog := "plugins:\n  - name: office\n    path: " + office + "\n"
@@ -124,18 +163,30 @@ func TestSandboxBindsEnabledPlugin(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.cfg.Auth.UsersDir = users
-	if _, err := m.Ensure(context.Background(), Request{User: "alice", Distribution: "default"}); err != nil {
+	inst, err := m.Ensure(context.Background(), Request{User: "alice", Distribution: "default"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	bound := false
+	userPlug := filepath.Join(inst.Home, "plugins", "office")
+	if _, err := os.Stat(filepath.Join(userPlug, "index.js")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(inst.Home, "user-cordis.patch.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), userPlug) || strings.Contains(string(data), office) {
+		t.Fatalf("patch must point at the user copy: %s", data)
+	}
 	argv := fake.starts[0].BwrapArgv
 	for i := 0; i+2 < len(argv); i++ {
-		if argv[i] == "--ro-bind" && argv[i+1] == office && argv[i+2] == office {
-			bound = true
+		if argv[i] == "--ro-bind" && argv[i+1] == office {
+			t.Fatalf("catalog plugin must not be mounted; users edit their home copy: %#v", argv)
 		}
 	}
-	if !bound {
-		t.Fatalf("plugin path was not bind-mounted: %#v", argv)
+	joined := strings.Join(argv, "\n")
+	if !strings.Contains(joined, "--bind") || !strings.Contains(joined, inst.Home) {
+		t.Fatalf("user home must stay writable for plugin edits: %s", joined)
 	}
 }
 
@@ -168,7 +219,8 @@ func TestEnsureBucketMountHidesSecret(t *testing.T) {
 	}
 	m.cfg.Auth.UsersDir = users
 
-	if _, err := m.Ensure(context.Background(), Request{User: "alice", Distribution: "default"}); err != nil {
+	inst, err := m.Ensure(context.Background(), Request{User: "alice", Distribution: "default"})
+	if err != nil {
 		t.Fatal(err)
 	}
 	spec := fake.starts[0]
@@ -186,7 +238,7 @@ func TestEnsureBucketMountHidesSecret(t *testing.T) {
 	if !strings.Contains(rclone, "--config") || !strings.Contains(rclone, "tos1:data/proj/raw") {
 		t.Fatalf("rclone argv: %s", rclone)
 	}
-	cfgPath := filepath.Join(m.cfg.Server.DataDir, "runtime", "alice-default", "fuse", "raw.rclone.conf")
+	cfgPath := filepath.Join(m.cfg.Server.DataDir, "runtime", inst.ID, "fuse", "raw.rclone.conf")
 	fi, err := os.Stat(cfgPath)
 	if err != nil {
 		t.Fatal(err)
@@ -201,7 +253,7 @@ func TestEnsureBucketMountHidesSecret(t *testing.T) {
 	if !strings.Contains(string(data), secret) {
 		t.Fatalf("isolated config missing secret: %s", data)
 	}
-	fusePoint := filepath.Join(m.cfg.Server.DataDir, "runtime", "alice-default", "fuse", "raw")
+	fusePoint := filepath.Join(m.cfg.Server.DataDir, "runtime", inst.ID, "fuse", "raw")
 	bound := false
 	for i := 0; i+2 < len(spec.BwrapArgv); i++ {
 		if spec.BwrapArgv[i] == "--ro-bind" && spec.BwrapArgv[i+1] == fusePoint && spec.BwrapArgv[i+2] == "/workspace/raw" {
@@ -258,11 +310,12 @@ func TestEnsureAppliesPluginsToHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	userPlug := filepath.Join(inst.Home, "plugins", "office")
 	data, err := os.ReadFile(filepath.Join(inst.Home, "user-cordis.patch.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "dw-plugin-office") || !strings.Contains(string(data), office) {
+	if !strings.Contains(string(data), "dw-plugin-office") || !strings.Contains(string(data), userPlug) {
 		t.Fatalf("patch: %s", data)
 	}
 	got, err := os.ReadFile(profile)
@@ -272,8 +325,8 @@ func TestEnsureAppliesPluginsToHome(t *testing.T) {
 	if string(got) != string(original) {
 		t.Fatalf("profile patch changed: %s", got)
 	}
-	if len(fake.starts[0].BwrapArgv) != 0 {
-		t.Fatal("plugins alone should not force bwrap")
+	if len(fake.starts[0].BwrapArgv) == 0 {
+		t.Fatal("dist must keep the instance sandboxed")
 	}
 }
 
@@ -310,5 +363,168 @@ func TestEnsureRemovesDisabledPluginsFromDataHome(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cfgDir, "homes", "alice", "user-cordis.patch.yml")); !os.IsNotExist(err) {
 		t.Fatalf("plugin edit landed in configDir/homes: %v", err)
+	}
+}
+
+func TestEnsureBindsResolvedDshPackageRoot(t *testing.T) {
+	fake := &fakeBackend{handle: readyHandle()}
+	m := newTestManager(t, fake)
+	root := t.TempDir()
+	pkg := filepath.Join(root, "lib", "node_modules", "dsh")
+	if err := os.MkdirAll(filepath.Join(pkg, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(pkg, "bin", "dsh")
+	if err := os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shimDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(shimDir, "dsh")
+	if err := os.Symlink(real, shim); err != nil {
+		t.Fatal(err)
+	}
+	m.cfg.Runtime.DSHBin = shim
+
+	if _, err := m.Ensure(context.Background(), Request{User: "alice", Distribution: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	spec := fake.starts[0]
+	resolved, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.DshBin != resolved {
+		t.Fatalf("spec dsh bin: %q want %q", spec.DshBin, resolved)
+	}
+	argv := spec.BwrapArgv
+	if !containsSeq(argv, "--", resolved, "--profile", "default") {
+		t.Fatalf("command must use the real path: %#v", argv)
+	}
+	for _, want := range []string{filepath.Dir(resolved), pkg, shimDir} {
+		if !containsSeq(argv, "--ro-bind", want, want) {
+			t.Fatalf("dsh bind %q missing: %#v", want, argv)
+		}
+	}
+	for i := 0; i+2 < len(argv); i++ {
+		if argv[i] == "--ro-bind" && argv[i+1] == "/" {
+			t.Fatalf("host root bind is forbidden: %#v", argv)
+		}
+	}
+}
+
+func TestResolveDshBinIgnoresPlainLibAncestor(t *testing.T) {
+	// A directory holding only a generic lib/ (think a user's ~/lib) is not an
+	// install root. Binding it read-only just because dsh lives underneath it
+	// would widen the sandbox for no reason.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(binDir, "dsh")
+	if err := os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nearestInstallRoot(filepath.Dir(exe)); got != "" {
+		t.Fatalf("lib-only ancestor %q treated as an install root", got)
+	}
+	got, binds := resolveDshBin(real)
+	if got != exe {
+		t.Fatalf("real path: %q want %q", got, exe)
+	}
+	for _, b := range binds {
+		if b == root {
+			t.Fatalf("lib-only ancestor %q was bound read-only: %#v", root, binds)
+		}
+	}
+}
+
+func TestResolveDshBinBindsInstallRoot(t *testing.T) {
+	root := t.TempDir()
+	pkg := filepath.Join(root, "lib", "node_modules", "dsh")
+	if err := os.MkdirAll(filepath.Join(pkg, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(pkg, "bin", "dsh")
+	if err := os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, binds := resolveDshBin(real)
+	if got != exe {
+		t.Fatalf("real path: %q want %q", got, exe)
+	}
+	installRoot := filepath.Join(root, "lib")
+	for _, want := range []string{filepath.Dir(exe), pkg, installRoot} {
+		found := false
+		for _, b := range binds {
+			if b == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("bind %q missing from %#v", want, binds)
+		}
+	}
+	for _, b := range binds {
+		if b == string(filepath.Separator) {
+			t.Fatalf("host root bind is forbidden: %#v", binds)
+		}
+	}
+}
+
+func containsSeq(argv []string, parts ...string) bool {
+	if len(parts) == 0 {
+		return false
+	}
+	for i := 0; i+len(parts) <= len(argv); i++ {
+		ok := true
+		for j, p := range parts {
+			if argv[i+j] != p {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func TestHostBasicsIncludesAccountFiles(t *testing.T) {
+	basics := hostBasics()
+	for _, want := range []string{"/etc/passwd", "/etc/group", "/etc/nsswitch.conf"} {
+		if _, err := os.Stat(want); err != nil {
+			continue
+		}
+		found := false
+		for _, p := range basics {
+			if p == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s missing from host basics: %#v", want, basics)
+		}
 	}
 }

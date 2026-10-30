@@ -151,15 +151,33 @@ func stopRecordedProcess(ctx context.Context, pid int, start uint64, specPath st
 		}
 	}
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	if syscall.Kill(pid, 0) != nil {
-		return nil
-	}
 	if waitProcessGone(ctx, pid, 5*time.Second) {
 		return nil
+	}
+	// Re-check liveness before escalating: the pid may have exited and been
+	// reused between the wait and the SIGKILL.
+	if !processAlive(pid, start) {
+		return nil
+	}
+	// A legacy record has no start time to compare, so re-read the command line
+	// right before the escalation: if it no longer points at this instance's
+	// spec file the pid was reused and must not receive SIGKILL.
+	if start == 0 && specPath != "" {
+		line := readCmdline(pid)
+		if line == "" || !strings.Contains(line, specPath) {
+			return nil
+		}
 	}
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
 	_ = syscall.Kill(pid, syscall.SIGKILL)
-	if waitProcessGone(ctx, pid, 5*time.Second) {
+	// The escalation runs on a fresh context: a caller that timed out must not
+	// leave a SIGTERM-ignoring process behind.
+	if waitProcessGone(context.Background(), pid, 5*time.Second) {
+		return nil
+	}
+	// Final liveness check: report failure only when the process is really gone
+	// from our point of view.
+	if !processAlive(pid, start) {
 		return nil
 	}
 	return errors.New("process did not exit")
@@ -181,7 +199,8 @@ func waitProcessGone(ctx context.Context, pid int, timeout time.Duration) bool {
 }
 
 // stopChild is the original Stop: SIGTERM the group, wait 5s, SIGKILL, wait
-// 5s. The timings are unchanged on purpose.
+// 5s. The timings are unchanged on purpose. A canceled caller context only
+// stops the wait, never the escalation: an HTTP timeout must not orphan dsh.
 func (h *Handle) stopChild(ctx context.Context) error {
 	if h.cmd == nil || h.cmd.Process == nil {
 		return nil
@@ -192,21 +211,40 @@ func (h *Handle) stopChild(ctx context.Context) error {
 	default:
 	}
 	_ = syscall.Kill(-h.cmd.Process.Pid, syscall.SIGTERM)
-	select {
-	case <-h.done:
+	if waitDone(h.done, ctx, 5*time.Second) {
 		return nil
-	case <-time.After(5 * time.Second):
-	case <-ctx.Done():
-		return ctx.Err()
+	}
+	// The child may have exited while we waited; do not signal a pid that may
+	// already belong to someone else.
+	if !processAlive(h.cmd.Process.Pid, h.pidStart) {
+		return nil
 	}
 	_ = syscall.Kill(-h.cmd.Process.Pid, syscall.SIGKILL)
+	_ = syscall.Kill(h.cmd.Process.Pid, syscall.SIGKILL)
+	// Escalation waits on a background timer so a canceled ctx cannot skip it.
 	select {
 	case <-h.done:
 		return nil
 	case <-time.After(5 * time.Second):
+	}
+	if processAlive(h.cmd.Process.Pid, h.pidStart) {
 		return errors.New("dsh did not exit")
+	}
+	return nil
+}
+
+// waitDone waits for done or the timeout. A canceled context only ends the
+// wait early; the caller still escalates.
+func waitDone(done <-chan struct{}, ctx context.Context, timeout time.Duration) bool {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
 	case <-ctx.Done():
-		return ctx.Err()
+		return false
 	}
 }
 
