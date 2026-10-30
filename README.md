@@ -9,6 +9,7 @@
 - 插件：站点 distribution 是底座，用户从本机 catalog 启用额外插件。
 - 配置：[`examples/config.local.yaml`](examples/config.local.yaml)、[`examples/storages.yaml`](examples/storages.yaml)、[`examples/distribution.yaml`](examples/distribution.yaml)
 - 说明：[`docs/local-mode.md`](docs/local-mode.md)、[`docs/plan.md`](docs/plan.md)
+- 下一版方案：[`docs/plan-v0.4.md`](docs/plan-v0.4.md)（登录即实例化、TOTP、插件版本化、挂载白名单/配额/审计、网络隔离）
 
 ## 快速开始
 
